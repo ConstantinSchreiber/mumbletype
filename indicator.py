@@ -1,18 +1,21 @@
-"""Floating cursor-adjacent indicator window using AppKit."""
+"""Floating waveform indicator that follows the cursor during recording/transcription."""
 
+import math
 import threading
 
 import AppKit
+import objc
 import Quartz
 from Foundation import NSObject
 
-# Strong references to pending trampolines so they aren't GC'd before execution
-_pending = set()
+import numpy as np
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+_pending = set()  # prevent GC of trampolines
 
 
 class _Trampoline(NSObject):
-    """Helper to dispatch a callable onto the main thread."""
-
     _blocks = {}
 
     def run_(self, _sender):
@@ -29,57 +32,159 @@ def _on_main(block):
     t.performSelectorOnMainThread_withObject_waitUntilDone_("run:", None, False)
 
 
-def _cg_to_appkit(cg_x, cg_y):
-    """Convert CG coordinates (top-left origin) to AppKit (bottom-left origin)."""
+def _cg_to_appkit(cg_point):
     primary_h = AppKit.NSScreen.screens()[0].frame().size.height
-    return (cg_x, primary_h - cg_y)
+    return (cg_point.x, primary_h - cg_point.y)
+
+
+# ── timer target ────────────────────────────────────────────────────────────
+
+
+class _TimerTarget(NSObject):
+    def initWithIndicator_(self, indicator):
+        self = objc.super(_TimerTarget, self).init()
+        self._indicator = indicator
+        return self
+
+    def tick_(self, timer):
+        self._indicator._tick()
+
+
+# ── waveform view ───────────────────────────────────────────────────────────
+
+
+class WaveformView(AppKit.NSView):
+    """Draws vertical rounded bars representing audio levels."""
+
+    BAR_COUNT = 20
+    BAR_WIDTH = 4.0
+    BAR_GAP = 2.5
+    BAR_RADIUS = 2.0
+    MIN_BAR_H = 4.0
+    PADDING_X = 7.0
+    PADDING_Y = 6.0
+
+    def initWithFrame_(self, frame):
+        self = objc.super(WaveformView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._bar_heights = [0.0] * self.BAR_COUNT
+        self._bar_color = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            1.0, 1.0, 1.0, 0.95
+        )
+        self._bg_color = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.12, 0.12, 0.14, 0.88
+        )
+        return self
+
+    @objc.python_method
+    def set_heights(self, heights):
+        self._bar_heights = heights
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def set_bar_color(self, ns_color):
+        self._bar_color = ns_color
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, dirty):
+        bounds = self.bounds()
+        w = bounds.size.width
+        h = bounds.size.height
+        usable_h = h - 2 * self.PADDING_Y
+
+        # Dark pill background
+        bg_path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            bounds, h / 2.0, h / 2.0
+        )
+        self._bg_color.setFill()
+        bg_path.fill()
+
+        # Bars
+        self._bar_color.setFill()
+        for i, level in enumerate(self._bar_heights):
+            bar_h = max(self.MIN_BAR_H, level * usable_h)
+            x = self.PADDING_X + i * (self.BAR_WIDTH + self.BAR_GAP)
+            y = (h - bar_h) / 2.0
+            bar_rect = AppKit.NSMakeRect(x, y, self.BAR_WIDTH, bar_h)
+            path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                bar_rect, self.BAR_RADIUS, self.BAR_RADIUS
+            )
+            path.fill()
+
+    def isFlipped(self):
+        return False
+
+
+# ── indicator ───────────────────────────────────────────────────────────────
+
+_WIDTH = 142
+_HEIGHT = 36
+_OFFSET_X = 16
+_OFFSET_Y = -44
+
+_BAR_COLORS = {
+    "recording": AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+        1.0, 1.0, 1.0, 0.95
+    ),
+    "transcribing": AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+        1.0, 0.82, 0.55, 0.90
+    ),
+}
 
 
 class Indicator:
-    """Tiny floating pill that follows the mouse cursor."""
+    """Floating waveform pill that follows the mouse during recording."""
 
-    _COLORS = {
-        "recording": (0.95, 0.22, 0.22, 0.92),
-        "transcribing": (1.0, 0.60, 0.0, 0.92),
-    }
-    _LABELS = {
-        "recording": "🎙",
-        "transcribing": "⏳",
-    }
-    _SIZE = 32
-    _OFFSET_X = 16
-    _OFFSET_Y = -40  # above the cursor
+    BAR_COUNT = 20
 
     def __init__(self):
         self._window = None
+        self._waveform_view = None
         self._tap = None
         self._tap_source = None
+        self._timer = None
+        self._timer_target = _TimerTarget.alloc().initWithIndicator_(self)
+        self._state = None
+        self._levels_lock = threading.Lock()
+        self._levels = [0.0] * self.BAR_COUNT
+        self._smooth = [0.0] * self.BAR_COUNT  # display-smoothed heights
+        self._anim_phase = 0.0
+        self._peak = 0.0  # adaptive gain: tracked peak RMS
+        self._PEAK_DECAY = 0.95  # how fast the peak envelope decays per chunk
+        self._PEAK_FLOOR = 0.01  # minimum peak to avoid amplifying silence/noise
+        self._ATTACK = 0.45  # how fast bars rise (per tick)
+        self._RELEASE = 0.12  # how fast bars fall (per tick)
 
-    def show(self, state: str = "recording"):
-        pos = self._get_mouse_pos()
+    # ── public API ──────────────────────────────────────────────────────
+
+    def show(self, state="recording"):
+        pos = _cg_to_appkit(Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
         _on_main(lambda: self._show(state, pos))
 
-    def update(self, state: str):
+    def update(self, state):
         _on_main(lambda: self._update(state))
 
     def hide(self):
         _on_main(self._hide)
 
-    @staticmethod
-    def _get_mouse_pos():
-        cg_pos = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-        return _cg_to_appkit(cg_pos.x, cg_pos.y)
+    def push_audio(self, chunk: np.ndarray):
+        """Called from audio thread. chunk is int16 mono ndarray."""
+        rms = np.sqrt(np.mean(chunk.astype(np.float32) ** 2)) / 32768.0
+        # Adaptive gain: track a decaying peak envelope, scale relative to it
+        self._peak = max(rms, self._peak * self._PEAK_DECAY)
+        effective_peak = max(self._peak, self._PEAK_FLOOR)
+        level = min(1.0, (rms / effective_peak) * 0.8)
+        with self._levels_lock:
+            self._levels.append(level)
+            self._levels.pop(0)
 
     # ── mouse tracking ──────────────────────────────────────────────────
 
     def _start_tracking(self):
-        """Install a CG event tap to follow mouse moves."""
-        if self._tap is not None:
-            return
-
-        def callback(_proxy, _type, event, _refcon):
+        def callback(_proxy, event_type, event, _refcon):
             cg_pos = Quartz.CGEventGetLocation(event)
-            appkit_pos = _cg_to_appkit(cg_pos.x, cg_pos.y)
+            appkit_pos = _cg_to_appkit(cg_pos)
             _on_main(lambda: self._move_to(appkit_pos))
             return event
 
@@ -97,22 +202,18 @@ class Indicator:
             None,
         )
         if self._tap is None:
-            print("⚠  Could not create event tap for mouse tracking (need Accessibility permission)")
+            print("⚠ Could not create event tap – check Accessibility permissions.")
             return
-
         self._tap_source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
         Quartz.CFRunLoopAddSource(
-            Quartz.CFRunLoopGetMain(),
-            self._tap_source,
-            Quartz.kCFRunLoopCommonModes,
+            Quartz.CFRunLoopGetMain(), self._tap_source, Quartz.kCFRunLoopCommonModes
         )
+        Quartz.CGEventTapEnable(self._tap, True)
 
     def _stop_tracking(self):
         if self._tap_source is not None:
             Quartz.CFRunLoopRemoveSource(
-                Quartz.CFRunLoopGetMain(),
-                self._tap_source,
-                Quartz.kCFRunLoopCommonModes,
+                Quartz.CFRunLoopGetMain(), self._tap_source, Quartz.kCFRunLoopCommonModes
             )
         if self._tap is not None:
             Quartz.CGEventTapEnable(self._tap, False)
@@ -122,23 +223,86 @@ class Indicator:
     def _move_to(self, pos):
         if self._window is None:
             return
-        s = self._SIZE
-        x = pos[0] + self._OFFSET_X
-        y = pos[1] + self._OFFSET_Y
+        x = pos[0] + _OFFSET_X
+        y = pos[1] + _OFFSET_Y
         self._window.setFrameOrigin_((x, y))
 
-    # ── internals (run on main thread) ───────────────────────────────────
+    # ── animation ───────────────────────────────────────────────────────
 
-    def _make_window(self, state: str, pos: tuple[float, float]):
-        label = self._LABELS[state]
-        color = self._COLORS[state]
-        s = self._SIZE
+    def _start_animation(self):
+        if self._timer is not None:
+            return
+        self._timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.05, self._timer_target, "tick:", None, True
+        )
 
-        x = pos[0] + self._OFFSET_X
-        y = pos[1] + self._OFFSET_Y
+    def _stop_animation(self):
+        if self._timer is not None:
+            self._timer.invalidate()
+            self._timer = None
+
+    def _tick(self):
+        if self._waveform_view is None:
+            return
+        if self._state == "recording":
+            with self._levels_lock:
+                targets = list(self._levels)
+            for i in range(self.BAR_COUNT):
+                if targets[i] > self._smooth[i]:
+                    self._smooth[i] += (targets[i] - self._smooth[i]) * self._ATTACK
+                else:
+                    self._smooth[i] += (targets[i] - self._smooth[i]) * self._RELEASE
+            self._waveform_view.set_heights(list(self._smooth))
+        elif self._state == "transcribing":
+            self._anim_phase += 0.15
+            heights = []
+            for i in range(self.BAR_COUNT):
+                v = 0.3 + 0.25 * math.sin(self._anim_phase + i * 0.35)
+                v += 0.15 * math.sin(self._anim_phase * 0.7 + i * 0.55)
+                heights.append(max(0.0, min(1.0, v)))
+            self._waveform_view.set_heights(heights)
+
+    # ── window management ───────────────────────────────────────────────
+
+    def _show(self, state, pos):
+        self._hide()
+        self._state = state
+        self._levels = [0.0] * self.BAR_COUNT
+        self._smooth = [0.0] * self.BAR_COUNT
+        self._anim_phase = 0.0
+        self._peak = 0.0
+        self._make_window(pos)
+        self._window.orderFrontRegardless()
+        self._start_tracking()
+        self._start_animation()
+
+    def _update(self, state):
+        self._state = state
+        with self._levels_lock:
+            self._levels = [0.0] * self.BAR_COUNT
+        self._anim_phase = 0.0
+        if self._waveform_view is not None:
+            color = _BAR_COLORS.get(state, _BAR_COLORS["recording"])
+            self._waveform_view.set_bar_color(color)
+        elif self._window is None:
+            pos = _cg_to_appkit(Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
+            self._show(state, pos)
+
+    def _hide(self):
+        self._stop_animation()
+        self._stop_tracking()
+        if self._window is not None:
+            self._window.orderOut_(None)
+            self._window = None
+        self._waveform_view = None
+
+    def _make_window(self, pos):
+        x = pos[0] + _OFFSET_X
+        y = pos[1] + _OFFSET_Y
+        frame = ((x, y), (_WIDTH, _HEIGHT))
 
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((x, y), (s, s)),
+            frame,
             AppKit.NSWindowStyleMaskBorderless,
             AppKit.NSBackingStoreBuffered,
             False,
@@ -149,46 +313,10 @@ class Indicator:
         window.setIgnoresMouseEvents_(True)
         window.setHasShadow_(True)
 
-        # Rounded pill view
-        view = AppKit.NSView.alloc().initWithFrame_(((0, 0), (s, s)))
-        view.setWantsLayer_(True)
-        view.layer().setCornerRadius_(s / 2)
-        ns_color = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(*color)
-        view.layer().setBackgroundColor_(ns_color.CGColor())
+        waveform = WaveformView.alloc().initWithFrame_(((0, 0), (_WIDTH, _HEIGHT)))
+        color = _BAR_COLORS.get(self._state, _BAR_COLORS["recording"])
+        waveform.set_bar_color(color)
 
-        # Emoji label — centered
-        tf = AppKit.NSTextField.labelWithString_(label)
-        tf.setFont_(AppKit.NSFont.systemFontOfSize_(16))
-        tf.setAlignment_(AppKit.NSTextAlignmentCenter)
-        tf.setFrame_(((0, 0), (s, s)))
-        intrinsic = tf.intrinsicContentSize()
-        tf.setFrame_(((0, (s - intrinsic.height) / 2), (s, intrinsic.height)))
-        view.addSubview_(tf)
-
-        window.setContentView_(view)
-        return window
-
-    def _show(self, state: str, pos: tuple[float, float]):
-        self._hide()
-        self._window = self._make_window(state, pos)
-        self._window.orderFrontRegardless()
-        self._start_tracking()
-
-    def _update(self, state: str):
-        if self._window is None:
-            pos = self._get_mouse_pos()
-            self._show(state, pos)
-            return
-        color = self._COLORS[state]
-        ns_color = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(*color)
-        view = self._window.contentView()
-        view.layer().setBackgroundColor_(ns_color.CGColor())
-        for subview in view.subviews():
-            if isinstance(subview, AppKit.NSTextField):
-                subview.setStringValue_(self._LABELS[state])
-
-    def _hide(self):
-        self._stop_tracking()
-        if self._window is not None:
-            self._window.orderOut_(None)
-            self._window = None
+        window.setContentView_(waveform)
+        self._window = window
+        self._waveform_view = waveform

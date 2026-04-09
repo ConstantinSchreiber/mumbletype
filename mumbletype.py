@@ -50,6 +50,7 @@ status_bar = None  # set in main()
 
 def audio_callback(indata, frames, time_info, status):
     audio_frames.append(indata.copy())
+    indicator.push_audio(indata)
 
 
 def start_recording():
