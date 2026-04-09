@@ -4,7 +4,6 @@
 import io
 import os
 import signal
-import subprocess
 import sys
 import threading
 import wave
@@ -53,9 +52,11 @@ def audio_callback(indata, frames, time_info, status):
     indicator.push_audio(indata)
 
 
-def start_recording():
-    global recording, stream, audio_frames
-    audio_frames = []
+def _ensure_stream():
+    """Create or reuse the audio input stream (avoids repeated device opens)."""
+    global stream
+    if stream is not None:
+        return
     device = config.get_audio_device()
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -64,20 +65,39 @@ def start_recording():
         callback=audio_callback,
         device=device,
     )
-    stream.start()
+
+
+def _invalidate_stream():
+    """Called when audio device config changes — forces stream re-creation."""
+    global stream
+    if stream is not None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        stream = None
+
+
+config.add_listener(_invalidate_stream)
+
+
+def start_recording():
+    global recording, audio_frames
+    audio_frames = []
     recording = True
     indicator.show("recording")
     if status_bar:
         status_bar.update_status("recording")
+    _ensure_stream()
+    stream.start()
     print("⏺  Recording…")
 
 
 def stop_recording():
-    global recording, stream
+    global recording
     if stream is not None:
         stream.stop()
-        stream.close()
-        stream = None
     recording = False
     indicator.update("transcribing")
     if status_bar:
@@ -126,44 +146,44 @@ def transcribe_and_type():
             status_bar.update_status("idle")
         return
 
-    config.record_usage(duration_seconds)
-    print(f"✓  {text}")
+    type_text(text)
     indicator.hide()
     if status_bar:
         status_bar.update_status("idle")
-    type_text(text)
+    print(f"✓  {text}")
+    config.record_usage(duration_seconds)
 
 
 def type_text(text: str):
     """Type text at the current cursor position via the clipboard + Cmd-V."""
+    import AppKit
+    import Quartz
+
+    pb = AppKit.NSPasteboard.generalPasteboard()
+
     # Save current clipboard
-    try:
-        old_clip = subprocess.run(
-            ["pbpaste"], capture_output=True, text=True
-        ).stdout
-    except Exception:
-        old_clip = None
+    old_clip = pb.stringForType_(AppKit.NSPasteboardTypeString)
 
     # Set clipboard to transcribed text
-    subprocess.run(["pbcopy"], input=text, text=True)
+    pb.clearContents()
+    pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
 
-    # Simulate Cmd-V
-    subprocess.run(
-        [
-            "osascript",
-            "-e",
-            'tell application "System Events" to keystroke "v" using command down',
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # Simulate Cmd-V via CGEvent (much faster than osascript subprocess)
+    source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    cmd_down = Quartz.CGEventCreateKeyboardEvent(source, 0x09, True)   # 0x09 = 'v'
+    cmd_up = Quartz.CGEventCreateKeyboardEvent(source, 0x09, False)
+    Quartz.CGEventSetFlags(cmd_down, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventSetFlags(cmd_up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, cmd_down)
+    Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, cmd_up)
 
     # Restore old clipboard after a short delay
     if old_clip is not None:
         def restore():
             import time
             time.sleep(0.5)
-            subprocess.run(["pbcopy"], input=old_clip, text=True)
+            pb.clearContents()
+            pb.setString_forType_(old_clip, AppKit.NSPasteboardTypeString)
         threading.Thread(target=restore, daemon=True).start()
 
 
@@ -211,7 +231,7 @@ def main():
     while True:
         event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
             AppKit.NSEventMaskAny,
-            NSDate.dateWithTimeIntervalSinceNow_(0.5),
+            NSDate.dateWithTimeIntervalSinceNow_(0.05),
             NSDefaultRunLoopMode,
             True,
         )

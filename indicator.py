@@ -30,6 +30,7 @@ def _on_main(block):
     _Trampoline._blocks[id(t)] = block
     _pending.add(t)
     t.performSelectorOnMainThread_withObject_waitUntilDone_("run:", None, False)
+    Quartz.CFRunLoopWakeUp(Quartz.CFRunLoopGetMain())
 
 
 def _cg_to_appkit(cg_point):
@@ -146,6 +147,7 @@ class Indicator:
         self._timer = None
         self._timer_target = _TimerTarget.alloc().initWithIndicator_(self)
         self._state = None
+        self._visible = False
         self._levels_lock = threading.Lock()
         self._levels = [0.0] * self.BAR_COUNT
         self._smooth = [0.0] * self.BAR_COUNT  # display-smoothed heights
@@ -181,7 +183,11 @@ class Indicator:
 
     # ── mouse tracking ──────────────────────────────────────────────────
 
-    def _start_tracking(self):
+    def _ensure_tracking(self):
+        if self._tap is not None:
+            Quartz.CGEventTapEnable(self._tap, True)
+            return
+
         def callback(_proxy, event_type, event, _refcon):
             cg_pos = Quartz.CGEventGetLocation(event)
             appkit_pos = _cg_to_appkit(cg_pos)
@@ -210,15 +216,9 @@ class Indicator:
         )
         Quartz.CGEventTapEnable(self._tap, True)
 
-    def _stop_tracking(self):
-        if self._tap_source is not None:
-            Quartz.CFRunLoopRemoveSource(
-                Quartz.CFRunLoopGetMain(), self._tap_source, Quartz.kCFRunLoopCommonModes
-            )
+    def _disable_tracking(self):
         if self._tap is not None:
             Quartz.CGEventTapEnable(self._tap, False)
-        self._tap = None
-        self._tap_source = None
 
     def _move_to(self, pos):
         if self._window is None:
@@ -265,15 +265,22 @@ class Indicator:
     # ── window management ───────────────────────────────────────────────
 
     def _show(self, state, pos):
-        self._hide()
         self._state = state
-        self._levels = [0.0] * self.BAR_COUNT
+        with self._levels_lock:
+            self._levels = [0.0] * self.BAR_COUNT
         self._smooth = [0.0] * self.BAR_COUNT
         self._anim_phase = 0.0
         self._peak = 0.0
-        self._make_window(pos)
+        if self._window is None:
+            self._make_window(pos)
+        else:
+            self._move_to(pos)
+        color = _BAR_COLORS.get(state, _BAR_COLORS["recording"])
+        self._waveform_view.set_bar_color(color)
+        self._waveform_view.set_heights([0.0] * self.BAR_COUNT)
         self._window.orderFrontRegardless()
-        self._start_tracking()
+        self._visible = True
+        self._ensure_tracking()
         self._start_animation()
 
     def _update(self, state):
@@ -281,20 +288,19 @@ class Indicator:
         with self._levels_lock:
             self._levels = [0.0] * self.BAR_COUNT
         self._anim_phase = 0.0
-        if self._waveform_view is not None:
+        if self._visible and self._waveform_view is not None:
             color = _BAR_COLORS.get(state, _BAR_COLORS["recording"])
             self._waveform_view.set_bar_color(color)
-        elif self._window is None:
+        else:
             pos = _cg_to_appkit(Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
             self._show(state, pos)
 
     def _hide(self):
         self._stop_animation()
-        self._stop_tracking()
+        self._disable_tracking()
+        self._visible = False
         if self._window is not None:
             self._window.orderOut_(None)
-            self._window = None
-        self._waveform_view = None
 
     def _make_window(self, pos):
         x = pos[0] + _OFFSET_X
