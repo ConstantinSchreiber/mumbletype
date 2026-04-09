@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What is WhisprFlow
+## What is Mumbletype
 
 A macOS-only menubar app that provides global voice-to-text input using OpenAI transcription models. Press Ctrl+D anywhere to record audio, which is transcribed via the OpenAI API and typed at the cursor position using clipboard + Cmd-V.
 
@@ -11,7 +11,7 @@ A macOS-only menubar app that provides global voice-to-text input using OpenAI t
 ```bash
 source venv/bin/activate
 pip install -r requirements.txt   # pynput, sounddevice, numpy, openai, python-dotenv
-python whisprflow.py
+python mumbletype.py
 ```
 
 Requires macOS Accessibility permission (for keyboard listener and event tap) and microphone access. Uses pyobjc (AppKit, Quartz, Foundation) which must be installed in the venv but is not listed in requirements.txt.
@@ -26,7 +26,7 @@ Requires macOS Accessibility permission (for keyboard listener and event tap) an
 
 All code lives in the project root (no packages/subfolders). There are no tests.
 
-- **whisprflow.py** — Entry point. Runs the AppKit event loop on main thread, keyboard listener (pynput) on background thread. Handles recording via `sounddevice`, transcription via OpenAI API, and text insertion via `pbcopy`/`osascript` Cmd-V.
+- **mumbletype.py** — Entry point. Runs the AppKit event loop on main thread, keyboard listener (pynput) on background thread. Handles recording via `sounddevice`, transcription via OpenAI API, and text insertion via `pbcopy`/`osascript` Cmd-V.
 - **config.py** — `Config` class: thread-safe singleton managing `.env` (API key) and `config.json` (model, audio device, usage/cost tracking). Supports change listeners that other components subscribe to.
 - **indicator.py** — `Indicator` class: floating AppKit pill window that follows the mouse cursor during recording/transcription. Uses CG event tap for mouse tracking, dispatches UI work to main thread via `_Trampoline` NSObject helper.
 - **statusbar.py** — `StatusBarController`: macOS menu bar icon with dropdown for model selection, usage stats, and preferences access. Delegates actions via `_MenuDelegate` NSObject.

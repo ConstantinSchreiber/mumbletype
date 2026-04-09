@@ -1,4 +1,4 @@
-"""Preferences window for WhisprFlow."""
+"""Preferences window for Mumbletype."""
 
 import AppKit
 import sounddevice as sd
@@ -74,7 +74,7 @@ class PreferencesWindowController:
         self._window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             frame, mask, AppKit.NSBackingStoreBuffered, False
         )
-        self._window.setTitle_("WhisprFlow Preferences")
+        self._window.setTitle_("Mumbletype Preferences")
         self._window.setDelegate_(self._delegate)
         self._window.setLevel_(AppKit.NSFloatingWindowLevel)
 

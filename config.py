@@ -1,4 +1,4 @@
-"""WhisprFlow configuration persistence and cost tracking."""
+"""Mumbletype configuration persistence and cost tracking."""
 
 import json
 import os

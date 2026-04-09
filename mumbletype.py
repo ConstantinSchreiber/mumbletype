@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WhisprFlow – global voice-to-text input using OpenAI transcription models."""
+"""Mumbletype – global voice-to-text input using OpenAI transcription models."""
 
 import io
 import os
@@ -184,7 +184,7 @@ def on_release(key):
 def main():
     global status_bar
 
-    print("WhisprFlow running  ·  Ctrl+D to record/stop  ·  Ctrl+C to quit")
+    print("Mumbletype running  ·  Ctrl+D to record/stop  ·  Ctrl+C to quit")
     print(f"Model: {config.get_model()}")
 
     # Start keyboard listener on a background thread

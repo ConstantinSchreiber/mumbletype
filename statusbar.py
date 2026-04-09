@@ -1,4 +1,4 @@
-"""Menu bar status item for WhisprFlow."""
+"""Menu bar status item for Mumbletype."""
 
 import AppKit
 from Foundation import NSObject
@@ -34,7 +34,7 @@ class _MenuDelegate(NSObject):
 
 
 class StatusBarController:
-    """NSStatusItem with dropdown menu for WhisprFlow controls."""
+    """NSStatusItem with dropdown menu for Mumbletype controls."""
 
     def __init__(self, config: Config):
         global _controller
@@ -52,7 +52,7 @@ class StatusBarController:
         # Menu bar icon
         button = self._status_item.button()
         img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "mic.fill", "WhisprFlow"
+            "mic.fill", "Mumbletype"
         )
         if img is None:
             # Fallback for older macOS
@@ -77,7 +77,7 @@ class StatusBarController:
 
         # Title
         title_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "WhisprFlow", None, ""
+            "Mumbletype", None, ""
         )
         title_item.setEnabled_(False)
         menu.addItem_(title_item)
@@ -147,7 +147,7 @@ class StatusBarController:
 
         # Quit
         quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Quit WhisprFlow", "quitApp:", "q"
+            "Quit Mumbletype", "quitApp:", "q"
         )
         quit_item.setTarget_(self._delegate)
         menu.addItem_(quit_item)
