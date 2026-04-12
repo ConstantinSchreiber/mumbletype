@@ -26,7 +26,7 @@ source venv/bin/activate
 python mumbletype.py
 ```
 
-- **Ctrl+D** — Hit once to record, hit again to have it transcribed
+- **Ctrl+d** — Hit once to record, hit again to have it transcribed
 - Click the menubar mic icon for model selection, usage stats, and preferences
 
 On first run, macOS will prompt for **Accessibility** and **Microphone** permissions.
