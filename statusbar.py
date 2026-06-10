@@ -1,10 +1,15 @@
 """Menu bar status item for Mumbletype."""
 
+import logging
+
 import AppKit
 from Foundation import NSObject
 
+import launchagent
 from config import Config
 from mainthread import run_on_main
+
+log = logging.getLogger(__name__)
 
 # Strong ref to prevent GC
 _controller = None
@@ -27,6 +32,9 @@ class _MenuDelegate(NSObject):
 
     def resetUsage_(self, sender):
         self._ctrl._config.reset_usage()
+
+    def toggleLogin_(self, sender):
+        self._ctrl._toggle_login()
 
     def quitApp_(self, sender):
         AppKit.NSApplication.sharedApplication().terminate_(None)
@@ -125,6 +133,12 @@ class StatusBarController:
         )
         prefs_item.setTarget_(self._delegate)
         menu.addItem_(prefs_item)
+
+        self._login_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Start at Login", "toggleLogin:", ""
+        )
+        self._login_mi.setTarget_(self._delegate)
+        menu.addItem_(self._login_mi)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
         quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -155,6 +169,29 @@ class StatusBarController:
         )
 
         self._hotkey_mi.setTitle_(f"Hotkey: {self._config.get_hotkey()[2]}")
+
+        self._login_mi.setState_(
+            AppKit.NSControlStateValueOn
+            if launchagent.is_installed()
+            else AppKit.NSControlStateValueOff
+        )
+
+    def _toggle_login(self):
+        try:
+            if launchagent.is_installed():
+                launchagent.uninstall()
+            else:
+                launchagent.install()
+                if not launchagent.is_launchd_managed():
+                    # The launchd-managed copy just started; hand over to it so
+                    # two instances don't both listen to the hotkey.
+                    log.info("handing off to the launchd-managed instance")
+                    self._refresh_titles()
+                    AppKit.NSApplication.sharedApplication().terminate_(None)
+                    return
+        except Exception:
+            log.exception("toggling Start at Login failed")
+        self._refresh_titles()
 
     def _open_preferences(self):
         from preferences import PreferencesWindowController
