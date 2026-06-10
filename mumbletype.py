@@ -6,16 +6,12 @@ import logging
 import logging.handlers
 import os
 import signal
-import sys
 import threading
 import wave
 
+import httpx
 import numpy as np
-import sounddevice as sd
 from openai import OpenAI
-from pynput import keyboard
-
-sys.path.insert(0, os.path.dirname(__file__))
 
 LOG_PATH = os.path.expanduser("~/Library/Logs/Mumbletype.log")
 
@@ -38,229 +34,213 @@ def setup_logging():
 setup_logging()
 log = logging.getLogger("mumbletype")
 
+from clipboard import paste_text
 from config import Config
-from indicator import Indicator
+from mainthread import run_on_main
+from recorder import CHANNELS, SAMPLE_RATE, Recorder
 
 config = Config()
 
+# ── OpenAI client ────────────────────────────────────────────────────────
+# Bounded timeout: the default (600s × retries) leaves the pill spinning for
+# ~20 minutes on a network hang. keepalive_expiry=60 keeps the connection
+# pre-warmed at recording start alive through a long dictation (httpx default
+# expires it after 5 idle seconds).
+
 _client: OpenAI | None = None
+_client_api_key: str | None = None
+_client_lock = threading.Lock()
+
 
 def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(api_key=config.get_api_key())
-    return _client
-
-def refresh_client():
-    global _client
-    _client = None
-
-config.add_listener(refresh_client)
-
-SAMPLE_RATE = 16000
-CHANNELS = 1
-HOTKEY = {keyboard.Key.ctrl_l, keyboard.KeyCode.from_char("d")}
-
-# ── state ────────────────────────────────────────────────────────────────
-recording = False
-audio_frames: list[np.ndarray] = []
-stream: sd.InputStream | None = None
-current_keys: set = set()
-lock = threading.Lock()
-indicator = Indicator()
-status_bar = None  # set in main()
+    global _client, _client_api_key
+    with _client_lock:
+        api_key = config.get_api_key()
+        if _client is None or api_key != _client_api_key:
+            if _client is not None:
+                try:
+                    _client.close()
+                except Exception:
+                    pass
+            timeout = httpx.Timeout(30.0, connect=5.0)
+            _client = OpenAI(
+                api_key=api_key,
+                max_retries=1,
+                timeout=timeout,
+                http_client=httpx.Client(
+                    timeout=timeout,
+                    limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=60.0),
+                ),
+            )
+            _client_api_key = api_key
+        return _client
 
 
-def audio_callback(indata, frames, time_info, status):
-    audio_frames.append(indata.copy())
-    indicator.push_audio(indata)
-
-
-def _ensure_stream():
-    """Create or reuse the audio input stream (avoids repeated device opens)."""
-    global stream
-    if stream is not None:
-        return
-    device = config.get_audio_device_name()
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="int16",
-        callback=audio_callback,
-        device=device,
-    )
-
-
-def _invalidate_stream():
-    """Called when audio device config changes — forces stream re-creation."""
-    global stream
-    if stream is not None:
-        try:
-            stream.stop()
-            stream.close()
-        except Exception:
-            pass
-        stream = None
-
-
-config.add_listener(_invalidate_stream)
-
-
-def start_recording():
-    global recording, audio_frames
-    audio_frames = []
-    recording = True
-    indicator.show("recording")
-    if status_bar:
-        status_bar.update_status("recording")
-    _ensure_stream()
-    stream.start()
-    log.info("recording started")
-
-
-def stop_recording():
-    global recording
-    if stream is not None:
-        stream.stop()
-    recording = False
-    indicator.update("transcribing")
-    if status_bar:
-        status_bar.update_status("transcribing")
-    log.info("recording stopped; transcribing")
-    threading.Thread(target=transcribe_and_type, daemon=True).start()
-
-
-def transcribe_and_type():
-    if not audio_frames:
-        log.warning("no audio captured")
-        indicator.hide()
-        if status_bar:
-            status_bar.update_status("idle")
-        return
-
-    audio_data = np.concatenate(audio_frames, axis=0)
-    duration_seconds = len(audio_data) / SAMPLE_RATE
-
-    # Write to WAV in memory
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # int16
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_data.tobytes())
-    buf.seek(0)
-    buf.name = "recording.wav"
-
+def _prewarm():
+    """Warm DNS/TCP/TLS to the API while the user is speaking (~250ms saved
+    on the transcription request after an idle period). Errors are irrelevant —
+    even a failed call establishes the connection."""
     try:
+        get_client().models.retrieve(config.get_model())
+    except Exception:
+        log.debug("prewarm request failed", exc_info=True)
+
+
+# ── application ──────────────────────────────────────────────────────────
+
+
+class App:
+    """Wires hotkey → recorder → transcription → paste.
+
+    UI session state (_ui_session) is owned by the main thread; recorder and
+    transcription callbacks marshal themselves there. The session guard means
+    a stale transcription finishing late can never hide or corrupt the pill
+    of a newer recording.
+    """
+
+    def __init__(self, indicator, status_bar):
+        self.indicator = indicator
+        self.status_bar = status_bar
+        self.recorder = Recorder(
+            config,
+            on_started=self._recording_started,
+            on_start_failed=self._recording_failed,
+            on_stopped=self._recording_stopped,
+            on_chunk=indicator.push_audio,
+        )
+        self._ui_session = 0
+
+    # ── recorder callbacks (worker thread) ──────────────────────────────
+
+    def _recording_started(self, sid):
+        threading.Thread(target=_prewarm, name="prewarm", daemon=True).start()
+        run_on_main(lambda: self._set_ui(sid, "recording"))
+
+    def _recording_failed(self, sid):
+        run_on_main(lambda: self._fail_ui(sid))
+
+    def _recording_stopped(self, sid, frames):
+        run_on_main(lambda: self._set_ui(sid, "transcribing"))
+        threading.Thread(
+            target=self._transcribe, args=(sid, frames),
+            name=f"transcribe-{sid}", daemon=True,
+        ).start()
+
+    # ── UI state (main thread) ──────────────────────────────────────────
+
+    def _set_ui(self, sid, state):
+        self._ui_session = sid
+        if state == "recording":
+            self.indicator.show("recording")
+        else:
+            self.indicator.update(state)
+        self.status_bar.update_status(state)
+
+    def _fail_ui(self, sid):
+        self._ui_session = sid
+        self.indicator.flash_error()
+        self.status_bar.update_status("idle")
+
+    def _finish(self, sid, ok):
+        if sid != self._ui_session:
+            return  # a newer recording owns the pill
+        if ok:
+            self.indicator.hide()
+        else:
+            self.indicator.flash_error()
+        self.status_bar.update_status("idle")
+
+    # ── transcription (one thread per recording) ────────────────────────
+
+    def _transcribe(self, sid, frames):
+        ok = False
+        try:
+            ok = self._transcribe_and_paste(frames)
+        except Exception:
+            log.exception("transcription failed")
+        run_on_main(lambda: self._finish(sid, ok))
+
+    @staticmethod
+    def _transcribe_and_paste(frames) -> bool:
+        if not frames:
+            log.warning("no audio captured")
+            return False
+
+        audio_data = np.concatenate(frames, axis=0)
+        duration_seconds = len(audio_data) / SAMPLE_RATE
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_data.tobytes())
+        buf.seek(0)
+        buf.name = "recording.wav"
+
         result = get_client().audio.transcriptions.create(
             model=config.get_model(), file=buf
         )
         text = result.text.strip()
-    except Exception:
-        log.exception("transcription failed")
-        indicator.hide()
-        if status_bar:
-            status_bar.update_status("idle")
-        return
+        if not text:
+            log.warning("empty transcription")
+            return False
 
-    if not text:
-        log.warning("empty transcription")
-        indicator.hide()
-        if status_bar:
-            status_bar.update_status("idle")
-        return
-
-    type_text(text)
-    indicator.hide()
-    if status_bar:
-        status_bar.update_status("idle")
-    log.info("transcribed: %s", text)
-    config.record_usage(duration_seconds)
-
-
-def type_text(text: str):
-    """Type text at the current cursor position via the clipboard + Cmd-V."""
-    import AppKit
-    import Quartz
-
-    pb = AppKit.NSPasteboard.generalPasteboard()
-
-    # Save current clipboard
-    old_clip = pb.stringForType_(AppKit.NSPasteboardTypeString)
-
-    # Set clipboard to transcribed text
-    pb.clearContents()
-    pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
-
-    # Simulate Cmd-V via CGEvent (much faster than osascript subprocess)
-    source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-    cmd_down = Quartz.CGEventCreateKeyboardEvent(source, 0x09, True)   # 0x09 = 'v'
-    cmd_up = Quartz.CGEventCreateKeyboardEvent(source, 0x09, False)
-    Quartz.CGEventSetFlags(cmd_down, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventSetFlags(cmd_up, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, cmd_down)
-    Quartz.CGEventPost(Quartz.kCGAnnotatedSessionEventTap, cmd_up)
-
-    # Restore old clipboard after a short delay
-    if old_clip is not None:
-        def restore():
-            import time
-            time.sleep(0.5)
-            pb.clearContents()
-            pb.setString_forType_(old_clip, AppKit.NSPasteboardTypeString)
-        threading.Thread(target=restore, daemon=True).start()
-
-
-def on_press(key):
-    current_keys.add(key)
-    if HOTKEY.issubset(current_keys):
-        with lock:
-            if not recording:
-                start_recording()
-            else:
-                stop_recording()
-        current_keys.clear()
-
-
-def on_release(key):
-    current_keys.discard(key)
+        paste_text(text)
+        log.info("transcribed %.1fs: %s", duration_seconds, text)
+        config.record_usage(duration_seconds)
+        return True
 
 
 def main():
-    global status_bar
-
     log.info("Mumbletype running · %s to record/stop · Ctrl+C to quit", config.get_hotkey()[2])
     log.info("model: %s", config.get_model())
 
-    # Start keyboard listener on a background thread
+    import AppKit
+    from indicator import Indicator
+    from statusbar import StatusBarController
+
+    ns_app = AppKit.NSApplication.sharedApplication()
+    ns_app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    app = App(Indicator(), StatusBarController(config))
+
+    # Keyboard listener (pynput, to be replaced by RegisterEventHotKey):
+    # the callback only enqueues a toggle, so it can neither block nor raise.
+    from pynput import keyboard
+
+    hotkey = {keyboard.Key.ctrl_l, keyboard.KeyCode.from_char("d")}
+    current_keys = set()
+
+    def on_press(key):
+        current_keys.add(key)
+        if hotkey.issubset(current_keys):
+            current_keys.clear()
+            app.recorder.toggle()
+
+    def on_release(key):
+        current_keys.discard(key)
+
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
 
-    # Run the AppKit run loop on the main thread (required for window rendering)
-    import AppKit
-    from statusbar import StatusBarController
-
-    app = AppKit.NSApplication.sharedApplication()
-    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
-
-    status_bar = StatusBarController(config)
-
     # Manually pump the event loop instead of app.run() so Python can handle
-    # SIGINT (Ctrl+C). app.run() blocks in ObjC and never lets Python dispatch signals.
-    app.finishLaunching()
-    signal.signal(signal.SIGINT, lambda *_: app.terminate_(None))
+    # SIGINT (Ctrl+C). app.run() blocks in ObjC and never lets Python dispatch
+    # signals.
+    ns_app.finishLaunching()
+    signal.signal(signal.SIGINT, lambda *_: ns_app.terminate_(None))
 
     from Foundation import NSDate, NSDefaultRunLoopMode
 
     while True:
-        event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+        event = ns_app.nextEventMatchingMask_untilDate_inMode_dequeue_(
             AppKit.NSEventMaskAny,
             NSDate.dateWithTimeIntervalSinceNow_(0.05),
             NSDefaultRunLoopMode,
             True,
         )
         if event is not None:
-            app.sendEvent_(event)
+            ns_app.sendEvent_(event)
 
 
 if __name__ == "__main__":
