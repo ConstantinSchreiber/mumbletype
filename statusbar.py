@@ -4,6 +4,7 @@ import AppKit
 from Foundation import NSObject
 
 from config import Config
+from mainthread import run_on_main
 
 # Strong ref to prevent GC
 _controller = None
@@ -20,28 +21,30 @@ class _MenuDelegate(NSObject):
     def selectModel_(self, sender):
         model_id = sender.representedObject()
         self._ctrl._config.set_model(model_id)
-        self._ctrl.refresh()
 
     def openPreferences_(self, sender):
         self._ctrl._open_preferences()
 
     def resetUsage_(self, sender):
         self._ctrl._config.reset_usage()
-        self._ctrl.refresh()
 
     def quitApp_(self, sender):
         AppKit.NSApplication.sharedApplication().terminate_(None)
 
 
 class StatusBarController:
-    """NSStatusItem with dropdown menu for Mumbletype controls."""
+    """NSStatusItem with dropdown menu for Mumbletype controls.
+
+    The menu is built once; status/config changes update item titles in place,
+    always on the main thread (update_status and config listeners may be
+    invoked from any thread).
+    """
 
     def __init__(self, config: Config):
         global _controller
         _controller = self  # prevent GC
 
         self._config = config
-        self._status = "Idle"
         self._prefs_window = None
         self._delegate = _MenuDelegate.alloc().initWithController_(self)
 
@@ -62,90 +65,67 @@ class StatusBarController:
             button.setImage_(img)
 
         self._build_menu()
-        self._config.add_listener(self.refresh)
+        self._refresh_titles()
+        self._config.add_listener(lambda: run_on_main(self._refresh_titles))
 
     def update_status(self, state: str):
         labels = {"idle": "Idle", "recording": "Recording...", "transcribing": "Transcribing..."}
-        self._status = labels.get(state, state)
-        self.refresh()
-
-    def refresh(self):
-        self._build_menu()
+        label = labels.get(state, state)
+        run_on_main(lambda: self._status_mi.setTitle_(f"Status: {label}"))
 
     def _build_menu(self):
         menu = AppKit.NSMenu.alloc().init()
 
-        # Title
-        title_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Mumbletype", None, ""
-        )
-        title_item.setEnabled_(False)
-        menu.addItem_(title_item)
+        def add_disabled(title):
+            item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, None, ""
+            )
+            item.setEnabled_(False)
+            menu.addItem_(item)
+            return item
+
+        add_disabled("Mumbletype")
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-        # Status
-        status_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f"Status: {self._status}", None, ""
-        )
-        status_item.setEnabled_(False)
-        menu.addItem_(status_item)
+        self._status_mi = add_disabled("Status: Idle")
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
         # Model submenu
-        current_model = self._config.get_model()
-        model_label = Config.MODELS.get(current_model, {}).get("label", current_model)
-        model_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f"Model: {model_label}", None, ""
+        self._model_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Model", None, ""
         )
         model_submenu = AppKit.NSMenu.alloc().init()
+        self._model_items = {}
         for model_id, info in Config.MODELS.items():
             mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 info["label"], "selectModel:", ""
             )
             mi.setTarget_(self._delegate)
             mi.setRepresentedObject_(model_id)
-            if model_id == current_model:
-                mi.setState_(AppKit.NSControlStateValueOn)
             model_submenu.addItem_(mi)
-        model_item.setSubmenu_(model_submenu)
-        menu.addItem_(model_item)
+            self._model_items[model_id] = mi
+        self._model_mi.setSubmenu_(model_submenu)
+        menu.addItem_(self._model_mi)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-        # Usage
-        usage = self._config.get_usage()
-        total_min = usage["total_seconds"] / 60.0
-        total_cost = usage["total_cost_usd"]
-        sessions = usage["session_count"]
-        usage_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f"Usage: {total_min:.1f} min \u00b7 ${total_cost:.4f} \u00b7 {sessions} sessions",
-            None, "",
-        )
-        usage_item.setEnabled_(False)
-        menu.addItem_(usage_item)
+        self._usage_mi = add_disabled("Usage:")
 
         reset_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Reset Usage Stats\u2026", "resetUsage:", ""
+            "Reset Usage Stats…", "resetUsage:", ""
         )
         reset_item.setTarget_(self._delegate)
         menu.addItem_(reset_item)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-        # Hotkey info
-        hk_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Hotkey: Ctrl+D", None, ""
-        )
-        hk_item.setEnabled_(False)
-        menu.addItem_(hk_item)
+        self._hotkey_mi = add_disabled("Hotkey:")
 
-        # Preferences
         prefs_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Preferences\u2026", "openPreferences:", ","
+            "Preferences…", "openPreferences:", ","
         )
         prefs_item.setTarget_(self._delegate)
         menu.addItem_(prefs_item)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-        # Quit
         quit_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit Mumbletype", "quitApp:", "q"
         )
@@ -153,6 +133,27 @@ class StatusBarController:
         menu.addItem_(quit_item)
 
         self._status_item.setMenu_(menu)
+
+    def _refresh_titles(self):
+        """Update config-derived titles in place. Main thread only."""
+        current_model = self._config.get_model()
+        model_label = Config.MODELS.get(current_model, {}).get("label", current_model)
+        self._model_mi.setTitle_(f"Model: {model_label}")
+        for model_id, mi in self._model_items.items():
+            mi.setState_(
+                AppKit.NSControlStateValueOn
+                if model_id == current_model
+                else AppKit.NSControlStateValueOff
+            )
+
+        usage = self._config.get_usage()
+        total_min = usage["total_seconds"] / 60.0
+        self._usage_mi.setTitle_(
+            f"Usage: {total_min:.1f} min · ${usage['total_cost_usd']:.4f}"
+            f" · {usage['session_count']} sessions"
+        )
+
+        self._hotkey_mi.setTitle_(f"Hotkey: {self._config.get_hotkey()[2]}")
 
     def _open_preferences(self):
         from preferences import PreferencesWindowController

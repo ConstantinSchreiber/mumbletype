@@ -1,37 +1,17 @@
-"""Floating waveform indicator that follows the cursor during recording/transcription."""
+"""Floating waveform pill shown bottom-center of the active screen during
+recording/transcription."""
 
 import math
 import threading
+import time
 
 import AppKit
 import objc
-import Quartz
 from Foundation import NSObject
 
 import numpy as np
 
-# ── helpers ─────────────────────────────────────────────────────────────────
-
-_pending = set()  # prevent GC of trampolines
-
-
-class _Trampoline(NSObject):
-    _blocks = {}
-
-    def run_(self, _sender):
-        block = self._blocks.pop(id(self), None)
-        _pending.discard(self)
-        if block:
-            block()
-
-
-def _on_main(block):
-    t = _Trampoline.alloc().init()
-    _Trampoline._blocks[id(t)] = block
-    _pending.add(t)
-    t.performSelectorOnMainThread_withObject_waitUntilDone_("run:", None, False)
-    Quartz.CFRunLoopWakeUp(Quartz.CFRunLoopGetMain())
-
+from mainthread import run_on_main
 
 # ── timer target ────────────────────────────────────────────────────────────
 
@@ -125,11 +105,16 @@ _BAR_COLORS = {
     "transcribing": AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
         1.0, 0.82, 0.55, 0.90
     ),
+    "error": AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+        1.0, 0.35, 0.35, 0.95
+    ),
 }
+
+_ERROR_FLASH_SECONDS = 1.2
 
 
 class Indicator:
-    """Floating waveform pill that follows the mouse during recording."""
+    """Floating waveform pill anchored bottom-center of the cursor's screen."""
 
     BAR_COUNT = 24
 
@@ -153,17 +138,22 @@ class Indicator:
         self._intro_target = (0, 0)
         self._outro_t = 1.0  # outro animation progress (0→1), starts done
         self._outro_origin = (0, 0)
+        self._error_until = 0.0  # monotonic deadline for the error flash
 
     # ── public API ──────────────────────────────────────────────────────
 
     def show(self, state="recording"):
-        _on_main(lambda: self._show(state))
+        run_on_main(lambda: self._show(state))
 
     def update(self, state):
-        _on_main(lambda: self._update(state))
+        run_on_main(lambda: self._update(state))
 
     def hide(self):
-        _on_main(self._hide)
+        run_on_main(self._hide)
+
+    def flash_error(self):
+        """Briefly show red bars, then auto-hide."""
+        run_on_main(self._flash_error)
 
     def push_audio(self, chunk: np.ndarray):
         """Called from audio thread. chunk is int16 mono ndarray."""
@@ -231,13 +221,28 @@ class Indicator:
                 v += 0.15 * math.sin(self._anim_phase * 0.7 + i * 0.55)
                 heights.append(max(0.0, min(1.0, v)))
             self._waveform_view.set_heights(heights)
+        elif self._state == "error":
+            self._waveform_view.set_heights([0.4] * self.BAR_COUNT)
+            if time.monotonic() >= self._error_until:
+                self._hide()
 
     # ── window management ───────────────────────────────────────────────
 
     @staticmethod
     def _bottom_center_pos():
-        """Compute bottom-center position on the screen containing the cursor."""
-        screen = AppKit.NSScreen.mainScreen()
+        """Compute bottom-center position on the screen containing the cursor.
+
+        NSScreen.mainScreen() is the key window's screen — always the primary
+        display for this accessory app — so locate the cursor explicitly.
+        """
+        loc = AppKit.NSEvent.mouseLocation()
+        screen = None
+        for s in AppKit.NSScreen.screens():
+            if AppKit.NSPointInRect(loc, s.frame()):
+                screen = s
+                break
+        if screen is None:
+            screen = AppKit.NSScreen.mainScreen() or AppKit.NSScreen.screens()[0]
         frame = screen.visibleFrame()
         x = frame.origin.x + (frame.size.width - _WIDTH) / 2.0
         y = frame.origin.y + _BOTTOM_MARGIN
@@ -245,6 +250,7 @@ class Indicator:
 
     def _show(self, state):
         self._state = state
+        self._outro_t = 1.0  # cancel any in-flight outro so it can't eat this pill
         with self._levels_lock:
             self._levels = [0.0] * self.BAR_COUNT
         self._smooth = [0.0] * self.BAR_COUNT
@@ -279,6 +285,13 @@ class Indicator:
             self._waveform_view.set_bar_color(color)
         else:
             self._show(state)
+
+    def _flash_error(self):
+        self._error_until = time.monotonic() + _ERROR_FLASH_SECONDS
+        if self._visible and self._waveform_view is not None:
+            self._update("error")
+        else:
+            self._show("error")
 
     def _hide(self):
         self._visible = False
