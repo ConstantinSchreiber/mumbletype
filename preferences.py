@@ -210,7 +210,7 @@ class PreferencesWindowController:
         self._device_popup.addItemWithTitle_("System Default")
         self._device_popup.lastItem().setRepresentedObject_(None)
 
-        current_device = self._config.get_audio_device()
+        current_name = self._config.get_audio_device_name()
         self._devices = []
 
         try:
@@ -219,8 +219,8 @@ class PreferencesWindowController:
                 if dev["max_input_channels"] > 0:
                     self._devices.append((i, dev["name"]))
                     self._device_popup.addItemWithTitle_(dev["name"])
-                    self._device_popup.lastItem().setRepresentedObject_(i)
-                    if i == current_device:
+                    self._device_popup.lastItem().setRepresentedObject_(dev["name"])
+                    if dev["name"] == current_name:
                         self._device_popup.selectItem_(self._device_popup.lastItem())
         except Exception:
             pass
@@ -277,7 +277,7 @@ class PreferencesWindowController:
         # Audio device
         dev_selected = self._device_popup.selectedItem()
         if dev_selected:
-            self._config.set_audio_device(dev_selected.representedObject())
+            self._config.set_audio_device_name(dev_selected.representedObject())
 
         self._window.close()
 

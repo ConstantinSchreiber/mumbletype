@@ -1,10 +1,18 @@
 """Mumbletype configuration persistence and cost tracking."""
 
 import json
+import logging
 import os
 import re
 import threading
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
+
+# Default record hotkey: Ctrl+D (Carbon virtual key / modifier mask).
+DEFAULT_HOTKEY_VIRTUAL_KEY = 0x02  # kVK_ANSI_D
+DEFAULT_HOTKEY_MODIFIER_MASK = 0x1000  # controlKey
+DEFAULT_HOTKEY_DISPLAY = "⌃D"
 
 
 class Config:
@@ -46,13 +54,32 @@ class Config:
             self._save()
         self._notify()
 
-    def get_audio_device(self) -> int | None:
-        """Return the stored audio device index, or None for system default."""
-        return self._data.get("audio_device")
+    def get_audio_device_name(self) -> str | None:
+        """Return the stored audio input device name, or None for system default."""
+        return self._data.get("audio_device_name")
 
-    def set_audio_device(self, device: int | None):
+    def set_audio_device_name(self, name: str | None):
         with self._lock:
-            self._data["audio_device"] = device
+            self._data["audio_device_name"] = name
+            self._save()
+        self._notify()
+
+    def get_hotkey(self) -> tuple[int, int, str]:
+        """Return (virtual_key, carbon_modifier_mask, display_string)."""
+        hk = self._data.get("hotkey") or {}
+        return (
+            hk.get("virtualKey", DEFAULT_HOTKEY_VIRTUAL_KEY),
+            hk.get("modifierMask", DEFAULT_HOTKEY_MODIFIER_MASK),
+            hk.get("display", DEFAULT_HOTKEY_DISPLAY),
+        )
+
+    def set_hotkey(self, virtual_key: int, modifier_mask: int, display: str):
+        with self._lock:
+            self._data["hotkey"] = {
+                "virtualKey": virtual_key,
+                "modifierMask": modifier_mask,
+                "display": display,
+            }
             self._save()
         self._notify()
 
@@ -81,14 +108,16 @@ class Config:
     # ── change listeners ─────────────────────────────────────────────────
 
     def add_listener(self, callback):
+        """Register a change callback. Callbacks may be invoked from ANY thread —
+        marshal UI work to the main thread yourself (see mainthread.run_on_main)."""
         self._listeners.append(callback)
 
     def _notify(self):
-        for cb in self._listeners:
+        for cb in list(self._listeners):
             try:
                 cb()
             except Exception:
-                pass
+                log.exception("config listener failed")
 
     # ── persistence ──────────────────────────────────────────────────────
 
@@ -121,14 +150,30 @@ class Config:
         # Ensure defaults
         self._data.setdefault("model", os.environ.get("TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe"))
         self._data.setdefault("usage", self._default_usage())
+        self._migrate_audio_device()
         self._save()
+
+    def _migrate_audio_device(self):
+        """Convert legacy PortAudio device index to a device name (indices shift
+        when devices are plugged/unplugged; names are stable)."""
+        if "audio_device" not in self._data:
+            return
+        index = self._data.pop("audio_device")
+        if isinstance(index, int) and "audio_device_name" not in self._data:
+            try:
+                import sounddevice as sd
+                self._data["audio_device_name"] = sd.query_devices(index)["name"]
+            except Exception:
+                log.warning("could not resolve legacy audio device index %r; using default", index)
 
     def _save(self):
         try:
-            with open(self._CONFIG_PATH, "w") as f:
+            tmp = self._CONFIG_PATH + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2)
+            os.replace(tmp, self._CONFIG_PATH)
         except OSError:
-            pass
+            log.exception("failed to save config")
 
     def _write_env_key(self, key: str):
         """Update or create the OPENAI_API_KEY line in .env."""

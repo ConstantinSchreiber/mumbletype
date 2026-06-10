@@ -2,6 +2,8 @@
 """Mumbletype – global voice-to-text input using OpenAI transcription models."""
 
 import io
+import logging
+import logging.handlers
 import os
 import signal
 import sys
@@ -14,6 +16,28 @@ from openai import OpenAI
 from pynput import keyboard
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+LOG_PATH = os.path.expanduser("~/Library/Logs/Mumbletype.log")
+
+
+def setup_logging():
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s [%(threadName)s] %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    file_handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=3)
+    file_handler.setFormatter(fmt)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+    # httpx/openai request logs are noisy at INFO
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
+
+setup_logging()
+log = logging.getLogger("mumbletype")
+
 from config import Config
 from indicator import Indicator
 
@@ -57,7 +81,7 @@ def _ensure_stream():
     global stream
     if stream is not None:
         return
-    device = config.get_audio_device()
+    device = config.get_audio_device_name()
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
@@ -91,7 +115,7 @@ def start_recording():
         status_bar.update_status("recording")
     _ensure_stream()
     stream.start()
-    print("⏺  Recording…")
+    log.info("recording started")
 
 
 def stop_recording():
@@ -102,13 +126,13 @@ def stop_recording():
     indicator.update("transcribing")
     if status_bar:
         status_bar.update_status("transcribing")
-    print("⏹  Stopped. Transcribing…")
+    log.info("recording stopped; transcribing")
     threading.Thread(target=transcribe_and_type, daemon=True).start()
 
 
 def transcribe_and_type():
     if not audio_frames:
-        print("⚠  No audio captured.")
+        log.warning("no audio captured")
         indicator.hide()
         if status_bar:
             status_bar.update_status("idle")
@@ -132,15 +156,15 @@ def transcribe_and_type():
             model=config.get_model(), file=buf
         )
         text = result.text.strip()
-    except Exception as e:
-        print(f"✗  Transcription error: {e}")
+    except Exception:
+        log.exception("transcription failed")
         indicator.hide()
         if status_bar:
             status_bar.update_status("idle")
         return
 
     if not text:
-        print("⚠  Empty transcription.")
+        log.warning("empty transcription")
         indicator.hide()
         if status_bar:
             status_bar.update_status("idle")
@@ -150,7 +174,7 @@ def transcribe_and_type():
     indicator.hide()
     if status_bar:
         status_bar.update_status("idle")
-    print(f"✓  {text}")
+    log.info("transcribed: %s", text)
     config.record_usage(duration_seconds)
 
 
@@ -205,8 +229,8 @@ def on_release(key):
 def main():
     global status_bar
 
-    print("Mumbletype running  ·  Ctrl+D to record/stop  ·  Ctrl+C to quit")
-    print(f"Model: {config.get_model()}")
+    log.info("Mumbletype running · %s to record/stop · Ctrl+C to quit", config.get_hotkey()[2])
+    log.info("model: %s", config.get_model())
 
     # Start keyboard listener on a background thread
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
