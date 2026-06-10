@@ -1,10 +1,14 @@
 """Preferences window for Mumbletype."""
 
+import threading
+
 import AppKit
 import sounddevice as sd
 from Foundation import NSObject
 
+import hotkey as hk
 from config import Config
+from mainthread import run_on_main
 
 
 class _WindowDelegate(NSObject):
@@ -39,15 +43,19 @@ class _ButtonTarget(NSObject):
     def validateKey_(self, sender):
         self._ctrl._validate_key()
 
+    def captureHotkey_(self, sender):
+        self._ctrl._begin_capture()
+
 
 class PreferencesWindowController:
     """NSWindow-based preferences panel."""
 
     _WIDTH = 480
-    _HEIGHT = 440
+    _HEIGHT = 460
 
-    def __init__(self, config: Config, on_close_callback=None):
+    def __init__(self, config: Config, hotkey_manager=None, on_close_callback=None):
         self._config = config
+        self._hotkey_manager = hotkey_manager
         self._on_close_callback = on_close_callback
         self._window = None
         self._key_field = None
@@ -59,6 +67,11 @@ class PreferencesWindowController:
         self._target = _ButtonTarget.alloc().initWithController_(self)
         self._validation_label = None
         self._devices = []
+        self._capture_monitor = None
+        self._pending_hotkey = None  # (virtual_key, carbon_mask, display)
+        self._change_btn = None
+        self._hotkey_hint = None
+        self._validate_btn = None
 
     def show(self):
         if self._window is not None:
@@ -117,6 +130,7 @@ class PreferencesWindowController:
         validate_btn.setTarget_(self._target)
         validate_btn.setAction_("validateKey:")
         content.addSubview_(validate_btn)
+        self._validate_btn = validate_btn
 
         y -= 36
 
@@ -172,14 +186,27 @@ class PreferencesWindowController:
         content.addSubview_(self._usage_label)
         y -= 40
 
-        # ── Hotkey info ──────────────────────────────────────────────────
+        # ── Hotkey section ───────────────────────────────────────────────
         y = self._add_section_label(content, "Record Hotkey", y)
 
-        hk_label = AppKit.NSTextField.labelWithString_("Ctrl + D")
-        hk_label.setFrame_(((20, y - 20), (w - 40, 16)))
-        hk_label.setFont_(AppKit.NSFont.systemFontOfSize_(12))
-        content.addSubview_(hk_label)
-        y -= 40
+        self._hotkey_label = AppKit.NSTextField.labelWithString_(self._config.get_hotkey()[2])
+        self._hotkey_label.setFrame_(((20, y - 22), (150, 18)))
+        self._hotkey_label.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+        content.addSubview_(self._hotkey_label)
+
+        self._change_btn = AppKit.NSButton.alloc().initWithFrame_(((170, y - 26), (130, 24)))
+        self._change_btn.setTitle_("Change…")
+        self._change_btn.setBezelStyle_(AppKit.NSBezelStyleRounded)
+        self._change_btn.setTarget_(self._target)
+        self._change_btn.setAction_("captureHotkey:")
+        content.addSubview_(self._change_btn)
+
+        self._hotkey_hint = AppKit.NSTextField.labelWithString_("")
+        self._hotkey_hint.setFrame_(((20, y - 42), (w - 40, 14)))
+        self._hotkey_hint.setFont_(AppKit.NSFont.systemFontOfSize_(11))
+        self._hotkey_hint.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+        content.addSubview_(self._hotkey_hint)
+        y -= 60
 
         # ── Bottom bar ───────────────────────────────────────────────────
         cancel_btn = AppKit.NSButton.alloc().initWithFrame_(((w - 170, 12), (75, 30)))
@@ -240,21 +267,81 @@ class PreferencesWindowController:
             self._key_secure_field.setHidden_(False)
             self._show_btn.setTitle_("Show")
 
+    # ── hotkey capture ───────────────────────────────────────────────────
+
+    def _begin_capture(self):
+        if self._capture_monitor is not None:
+            return
+        if self._hotkey_manager is not None:
+            # The active chord is consumed system-wide while registered — the
+            # local monitor would never see it. Pause for the capture.
+            self._hotkey_manager.pause()
+        self._change_btn.setTitle_("Press shortcut…")
+        self._hotkey_hint.setStringValue_("Press a key combination (Esc cancels)")
+        self._capture_monitor = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskKeyDown, self._handle_capture_event
+        )
+
+    def _handle_capture_event(self, event):
+        """Local keyDown monitor during capture. Returns None to swallow."""
+        mods = hk.carbon_mask_from_cocoa(event.modifierFlags())
+        if event.keyCode() == hk.ESCAPE_KEY_CODE and mods == 0:
+            self._end_capture()
+            return None
+        if mods == 0:
+            self._hotkey_hint.setStringValue_("Needs at least one modifier (⌃ ⌥ ⇧ ⌘)")
+            return None
+        if hk.is_forbidden(event.keyCode(), mods):
+            self._hotkey_hint.setStringValue_("⌘V can't be used — it would eat the paste itself")
+            return None
+        display = hk.display_for(mods, hk.key_label_for_event(event))
+        self._pending_hotkey = (event.keyCode(), mods, display)
+        self._hotkey_label.setStringValue_(display)
+        self._end_capture()
+        self._hotkey_hint.setStringValue_("Click Save to apply")
+        return None
+
+    def _end_capture(self):
+        """Always restores the global hotkey; safe to call repeatedly."""
+        if self._capture_monitor is not None:
+            AppKit.NSEvent.removeMonitor_(self._capture_monitor)
+            self._capture_monitor = None
+        if self._change_btn is not None:
+            self._change_btn.setTitle_("Change…")
+            self._hotkey_hint.setStringValue_("")
+        if self._hotkey_manager is not None:
+            self._hotkey_manager.resume()
+
+    # ── API key validation ───────────────────────────────────────────────
+
     def _validate_key(self):
         key = self._get_current_key()
         if not key:
             self._validation_label.setStringValue_("No API key entered")
             self._validation_label.setTextColor_(AppKit.NSColor.systemRedColor())
             return
-        try:
-            from openai import OpenAI
-            test_client = OpenAI(api_key=key)
-            test_client.models.list()
-            self._validation_label.setStringValue_("Valid API key")
-            self._validation_label.setTextColor_(AppKit.NSColor.systemGreenColor())
-        except Exception as e:
-            self._validation_label.setStringValue_(f"Invalid: {e}")
-            self._validation_label.setTextColor_(AppKit.NSColor.systemRedColor())
+        self._validate_btn.setEnabled_(False)
+        self._validation_label.setStringValue_("Testing…")
+        self._validation_label.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+
+        def work():
+            try:
+                from openai import OpenAI
+                OpenAI(api_key=key, timeout=10.0, max_retries=0).models.list()
+                result, color = "Valid API key", AppKit.NSColor.systemGreenColor()
+            except Exception as e:
+                result, color = f"Invalid: {e}", AppKit.NSColor.systemRedColor()
+
+            def apply():
+                if self._window is None:
+                    return  # window closed while testing
+                self._validation_label.setStringValue_(result)
+                self._validation_label.setTextColor_(color)
+                self._validate_btn.setEnabled_(True)
+
+            run_on_main(apply)
+
+        threading.Thread(target=work, name="key-validate", daemon=True).start()
 
     def _get_current_key(self) -> str:
         if self._key_visible:
@@ -279,12 +366,20 @@ class PreferencesWindowController:
         if dev_selected:
             self._config.set_audio_device_name(dev_selected.representedObject())
 
+        # Hotkey
+        if self._pending_hotkey is not None:
+            self._config.set_hotkey(*self._pending_hotkey)
+            self._pending_hotkey = None
+
         self._window.close()
 
     def _cancel(self):
         self._window.close()
 
     def _on_close(self):
+        # A leaked capture monitor or a paused global hotkey must not survive
+        # the window — end capture unconditionally.
+        self._end_capture()
         self._window = None
         if self._on_close_callback:
             self._on_close_callback()

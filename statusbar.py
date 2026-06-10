@@ -40,11 +40,12 @@ class StatusBarController:
     invoked from any thread).
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, hotkey_manager=None):
         global _controller
         _controller = self  # prevent GC
 
         self._config = config
+        self._hotkey_manager = hotkey_manager
         self._prefs_window = None
         self._delegate = _MenuDelegate.alloc().initWithController_(self)
 
@@ -163,7 +164,9 @@ class StatusBarController:
         app.activateIgnoringOtherApps_(True)
 
         if self._prefs_window is None or self._prefs_window._window is None:
-            self._prefs_window = PreferencesWindowController(self._config, self._on_prefs_closed)
+            self._prefs_window = PreferencesWindowController(
+                self._config, self._hotkey_manager, self._on_prefs_closed
+            )
         self._prefs_window.show()
 
     def _on_prefs_closed(self):

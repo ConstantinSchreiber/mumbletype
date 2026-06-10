@@ -98,9 +98,9 @@ class App:
     of a newer recording.
     """
 
-    def __init__(self, indicator, status_bar):
+    def __init__(self, indicator):
         self.indicator = indicator
-        self.status_bar = status_bar
+        self.status_bar = None  # attached in main() once the menu bar exists
         self.recorder = Recorder(
             config,
             on_started=self._recording_started,
@@ -134,12 +134,14 @@ class App:
             self.indicator.show("recording")
         else:
             self.indicator.update(state)
-        self.status_bar.update_status(state)
+        if self.status_bar:
+            self.status_bar.update_status(state)
 
     def _fail_ui(self, sid):
         self._ui_session = sid
         self.indicator.flash_error()
-        self.status_bar.update_status("idle")
+        if self.status_bar:
+            self.status_bar.update_status("idle")
 
     def _finish(self, sid, ok):
         if sid != self._ui_session:
@@ -148,7 +150,8 @@ class App:
             self.indicator.hide()
         else:
             self.indicator.flash_error()
-        self.status_bar.update_status("idle")
+        if self.status_bar:
+            self.status_bar.update_status("idle")
 
     # ── transcription (one thread per recording) ────────────────────────
 
@@ -204,11 +207,12 @@ def main():
     ns_app = AppKit.NSApplication.sharedApplication()
     ns_app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 
-    app = App(Indicator(), StatusBarController(config))
+    app = App(Indicator())
 
     # The hotkey callback fires on the main thread and only enqueues a toggle,
     # so it can neither block the event loop nor raise.
-    HotkeyManager(config, on_fire=app.recorder.toggle)
+    hotkey_manager = HotkeyManager(config, on_fire=app.recorder.toggle)
+    app.status_bar = StatusBarController(config, hotkey_manager)
 
     # Manually pump the event loop instead of app.run() so Python can handle
     # SIGINT (Ctrl+C). app.run() blocks in ObjC and never lets Python dispatch
