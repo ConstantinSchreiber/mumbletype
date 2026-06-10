@@ -197,6 +197,7 @@ def main():
     log.info("model: %s", config.get_model())
 
     import AppKit
+    from hotkey import HotkeyManager
     from indicator import Indicator
     from statusbar import StatusBarController
 
@@ -205,28 +206,14 @@ def main():
 
     app = App(Indicator(), StatusBarController(config))
 
-    # Keyboard listener (pynput, to be replaced by RegisterEventHotKey):
-    # the callback only enqueues a toggle, so it can neither block nor raise.
-    from pynput import keyboard
-
-    hotkey = {keyboard.Key.ctrl_l, keyboard.KeyCode.from_char("d")}
-    current_keys = set()
-
-    def on_press(key):
-        current_keys.add(key)
-        if hotkey.issubset(current_keys):
-            current_keys.clear()
-            app.recorder.toggle()
-
-    def on_release(key):
-        current_keys.discard(key)
-
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
+    # The hotkey callback fires on the main thread and only enqueues a toggle,
+    # so it can neither block the event loop nor raise.
+    HotkeyManager(config, on_fire=app.recorder.toggle)
 
     # Manually pump the event loop instead of app.run() so Python can handle
     # SIGINT (Ctrl+C). app.run() blocks in ObjC and never lets Python dispatch
-    # signals.
+    # signals. Events (incl. the Carbon hotkey) and timers fire while blocked
+    # inside nextEventMatchingMask, so the timeout only bounds SIGINT latency.
     ns_app.finishLaunching()
     signal.signal(signal.SIGINT, lambda *_: ns_app.terminate_(None))
 
@@ -235,7 +222,7 @@ def main():
     while True:
         event = ns_app.nextEventMatchingMask_untilDate_inMode_dequeue_(
             AppKit.NSEventMaskAny,
-            NSDate.dateWithTimeIntervalSinceNow_(0.05),
+            NSDate.dateWithTimeIntervalSinceNow_(0.5),
             NSDefaultRunLoopMode,
             True,
         )

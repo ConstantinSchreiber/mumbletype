@@ -8,7 +8,9 @@ DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,
     "packages": [
-        "pynput",
+        # quickmachotkey lazily loads HIToolbox; the explicit packages entry
+        # keeps bundlers from missing it (untested with py2app).
+        "quickmachotkey",
         "sounddevice",
         "numpy",
         "openai",

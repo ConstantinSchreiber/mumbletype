@@ -1,5 +1,7 @@
-pynput
 sounddevice
 numpy
 openai
 python-dotenv
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+quickmachotkey==2025.7.28
