@@ -10,14 +10,10 @@ Requires macOS and an [OpenAI API key](https://platform.openai.com/api-keys).
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-pip install pyobjc-framework-Cocoa pyobjc-framework-Quartz
 ```
 
-Create a `.env` file with your API key (or set it later in Preferences):
-
-```
-OPENAI_API_KEY=sk-...
-```
+Set your API key in Preferences after launching (or create
+`~/Library/Application Support/Mumbletype/.env` containing `OPENAI_API_KEY=sk-...`).
 
 ## Usage
 
@@ -26,10 +22,18 @@ source venv/bin/activate
 python mumbletype.py
 ```
 
-- **Ctrl+d** — Hit once to record, hit again to have it transcribed
-- Click the menubar mic icon for model selection, usage stats, and preferences
+- **⌃D** (configurable) — Hit once to record, hit again to transcribe and paste
+- Click the menubar mic icon for model selection, usage stats, Start at Login, and preferences
+- Change the hotkey in Preferences → Record Hotkey → Change…
 
-On first run, macOS will prompt for **Accessibility** and **Microphone** permissions.
+The hotkey is registered system-wide via Carbon `RegisterEventHotKey`: it is
+consumed by Mumbletype and never reaches the focused app, and no Accessibility
+or Input Monitoring permission is needed for listening. On first run macOS
+will still prompt for **Microphone** access (recording) and **Accessibility**
+(only for the synthetic ⌘V paste).
+
+**Start at Login** (menubar toggle) installs a LaunchAgent that also restarts
+the app automatically if it ever crashes. Quitting from the menu stays quit.
 
 ## Models
 
@@ -43,7 +47,17 @@ Switch models from the menubar dropdown or Preferences window.
 
 ## How it works
 
-Mumbletype runs as a menubar-only app (no dock icon). It listens for the global hotkey via `pynput`, records audio with `sounddevice`, sends it to the OpenAI transcription API, and pastes the result at your cursor position. A small floating indicator follows your mouse during recording and transcription.
+Mumbletype runs as a menubar-only app (no dock icon). The global hotkey
+toggles recording with `sounddevice`; audio is sent in-memory to the OpenAI
+transcription API and the result is pasted at the cursor via the clipboard +
+a synthetic ⌘V. Your previous clipboard contents — including images and rich
+text — are restored afterwards (unless you copied something in the meantime,
+in which case your copy wins). A floating waveform pill appears bottom-center
+of the screen your cursor is on during recording and transcription, and
+flashes red if transcription fails.
+
+Configuration lives in `~/Library/Application Support/Mumbletype/`; logs in
+`~/Library/Logs/Mumbletype.log`.
 
 ## License
 
