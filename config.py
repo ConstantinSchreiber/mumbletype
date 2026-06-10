@@ -16,7 +16,7 @@ class Config:
         "whisper-1": {"rate_per_min": 0.006, "label": "Whisper-1"},
     }
 
-    _DIR = os.path.dirname(__file__)
+    _DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Mumbletype")
     _CONFIG_PATH = os.path.join(_DIR, "config.json")
     _ENV_PATH = os.path.join(_DIR, ".env")
 
@@ -93,6 +93,17 @@ class Config:
     # ── persistence ──────────────────────────────────────────────────────
 
     def _load(self):
+        os.makedirs(self._DIR, exist_ok=True)
+
+        # Migrate old config files from project directory if they exist
+        old_dir = os.path.dirname(os.path.abspath(__file__))
+        for fname in ("config.json", ".env"):
+            old_path = os.path.join(old_dir, fname)
+            new_path = os.path.join(self._DIR, fname)
+            if os.path.exists(old_path) and not os.path.exists(new_path):
+                import shutil
+                shutil.copy2(old_path, new_path)
+
         # Load .env for API key
         from dotenv import load_dotenv
         load_dotenv(self._ENV_PATH)
