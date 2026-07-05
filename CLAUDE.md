@@ -18,7 +18,7 @@ Requires macOS Microphone access and Accessibility permission (only for posting 
 
 ## Configuration
 
-- Stored in `~/Library/Application Support/Mumbletype/`: `.env` (`OPENAI_API_KEY`) and `config.json` (model, hotkey, audio device name, usage stats)
+- Stored in `~/Library/Application Support/Mumbletype/`: `.env` (`OPENAI_API_KEY`), `config.json` (model, hotkey, audio device name, usage stats), and `history.json` (transcription history, 30-day retention)
 - **Default model**: `gpt-4o-mini-transcribe` (also `gpt-4o-transcribe`, `whisper-1`)
 - Audio devices are persisted by **name** (PortAudio indices shift across replug/reboot)
 
@@ -31,9 +31,10 @@ All code lives in the project root (no packages/subfolders). There are no tests;
 - **recorder.py** — `Recorder`: dedicated worker thread owns the sounddevice stream; `toggle()` enqueues so rapid hotkey presses serialize. Per-recording capture buffer is handed off by value. Device name re-resolved to an index at every start (survives unplug; config changes never disturb an active recording).
 - **clipboard.py** — `paste_text()`: snapshots ALL pasteboard types (fresh `NSPasteboardItem` copies — items belong to one pasteboard forever), posts ⌘V via CGEvent, restores after 1s only if `changeCount` is unchanged.
 - **config.py** — `Config`: thread-safe singleton over `.env` + `config.json` (atomic writes). Change listeners may fire on ANY thread — marshal UI work via `mainthread.run_on_main`.
+- **history.py** — `History`: thread-safe transcription log over `history.json` (atomic writes; same listener contract as Config). Every transcription is added *before* pasting so text survives a hijacked focus/paste. Pruned on load and add (30 days / 500 entries).
 - **mainthread.py** — `run_on_main(block)`: trampoline to run a block on the AppKit main thread from any thread.
 - **indicator.py** — Floating waveform pill (borderless NSWindow), bottom-center of the screen containing the cursor; recording/transcribing/error states with intro/outro animations.
-- **statusbar.py** — `StatusBarController`: NSStatusItem menu built once; titles updated in place on the main thread. Start at Login toggle (see launchagent.py).
+- **statusbar.py** — `StatusBarController`: NSStatusItem menu built once; titles updated in place on the main thread. History submenu is the exception: repopulated on every open via `menuNeedsUpdate:` (clicking an entry copies it back to the clipboard — no paste, no restore). Start at Login toggle (see launchagent.py).
 - **launchagent.py** — LaunchAgent install/uninstall (`~/Library/LaunchAgents/com.mumbletype.plist`, `KeepAlive.SuccessfulExit=false` → crash restarts, clean quit stays quit). Never `bootout` the label from the launchd-managed instance itself.
 - **preferences.py** — Programmatic AppKit preferences window (API key with async Test, model, audio device by name, hotkey capture via local NSEvent monitor — the global hotkey is paused during capture and always resumed).
 - **setup.py** — py2app build script (untested deliverable).

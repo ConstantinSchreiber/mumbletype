@@ -1,6 +1,7 @@
 """Menu bar status item for Mumbletype."""
 
 import logging
+from datetime import datetime, timezone
 
 import AppKit
 from Foundation import NSObject
@@ -13,6 +14,29 @@ log = logging.getLogger(__name__)
 
 # Strong ref to prevent GC
 _controller = None
+
+_HISTORY_MENU_LIMIT = 15
+_SNIPPET_LEN = 60
+
+
+def _snippet(text: str, limit: int = _SNIPPET_LEN) -> str:
+    s = " ".join(text.split())
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def _age(ts_iso: str) -> str:
+    try:
+        ts = datetime.fromisoformat(ts_iso)
+    except (ValueError, TypeError):
+        return "?"
+    seconds = max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+    if seconds < 60:
+        return "now"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 
 class _MenuDelegate(NSObject):
@@ -33,6 +57,17 @@ class _MenuDelegate(NSObject):
     def resetUsage_(self, sender):
         self._ctrl._config.reset_usage()
 
+    def copyHistoryItem_(self, sender):
+        self._ctrl._copy_history_item(sender.representedObject())
+
+    def clearHistory_(self, sender):
+        if self._ctrl._history:
+            self._ctrl._history.clear()
+
+    def menuNeedsUpdate_(self, menu):
+        # AppKit calls this on the main thread each time the submenu opens.
+        self._ctrl._populate_history_menu(menu)
+
     def toggleLogin_(self, sender):
         self._ctrl._toggle_login()
 
@@ -48,12 +83,13 @@ class StatusBarController:
     invoked from any thread).
     """
 
-    def __init__(self, config: Config, hotkey_manager=None):
+    def __init__(self, config: Config, hotkey_manager=None, history=None):
         global _controller
         _controller = self  # prevent GC
 
         self._config = config
         self._hotkey_manager = hotkey_manager
+        self._history = history
         self._prefs_window = None
         self._delegate = _MenuDelegate.alloc().initWithController_(self)
 
@@ -115,6 +151,18 @@ class StatusBarController:
             self._model_items[model_id] = mi
         self._model_mi.setSubmenu_(model_submenu)
         menu.addItem_(self._model_mi)
+
+        # History submenu — repopulated on every open via menuNeedsUpdate:,
+        # so no listener wiring is needed to keep it fresh.
+        if self._history is not None:
+            history_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "History", None, ""
+            )
+            self._history_menu = AppKit.NSMenu.alloc().init()
+            self._history_menu.setDelegate_(self._delegate)
+            history_mi.setSubmenu_(self._history_menu)
+            menu.addItem_(history_mi)
+
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
         self._usage_mi = add_disabled("Usage:")
@@ -175,6 +223,42 @@ class StatusBarController:
             if launchagent.is_installed()
             else AppKit.NSControlStateValueOff
         )
+
+    def _populate_history_menu(self, menu):
+        """Rebuild the History submenu from the store. Main thread only."""
+        menu.removeAllItems()
+        entries = self._history.entries() if self._history else []
+        if not entries:
+            empty = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "No transcriptions yet", None, ""
+            )
+            empty.setEnabled_(False)
+            menu.addItem_(empty)
+            return
+        for entry in entries[:_HISTORY_MENU_LIMIT]:
+            title = f"{_age(entry.get('ts', ''))} · {_snippet(entry['text'])}"
+            mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, "copyHistoryItem:", ""
+            )
+            mi.setTarget_(self._delegate)
+            mi.setRepresentedObject_(entry["text"])
+            mi.setToolTip_(entry["text"])
+            menu.addItem_(mi)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        clear_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Clear History", "clearHistory:", ""
+        )
+        clear_mi.setTarget_(self._delegate)
+        menu.addItem_(clear_mi)
+
+    def _copy_history_item(self, text):
+        """Put a past transcription back on the clipboard — plain copy, no
+        paste, no restore: the user grabs it whenever they're ready."""
+        if not text:
+            return
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
 
     def _toggle_login(self):
         try:

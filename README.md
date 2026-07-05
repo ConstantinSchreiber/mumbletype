@@ -23,7 +23,8 @@ python mumbletype.py
 ```
 
 - **⌃D** (configurable) — Hit once to record, hit again to transcribe and paste
-- Click the menubar mic icon for model selection, usage stats, Start at Login, and preferences
+- Click the menubar mic icon for model selection, history, usage stats, Start at Login, and preferences
+- **History** submenu — every transcription is kept for 30 days; click an entry to copy it back to the clipboard (rescues text when a prompt or stray click steals focus and the paste goes astray)
 - Change the hotkey in Preferences → Record Hotkey → Change…
 
 The hotkey is registered system-wide via Carbon `RegisterEventHotKey`: it is
@@ -55,6 +56,11 @@ text — are restored afterwards (unless you copied something in the meantime,
 in which case your copy wins). A floating waveform pill appears bottom-center
 of the screen your cursor is on during recording and transcription, and
 flashes red if transcription fails.
+
+Every transcription is also logged to a local history (before pasting, so
+nothing is lost if the paste lands in the wrong window). The menubar History
+submenu shows the recent entries; clicking one copies it to the clipboard.
+Entries are pruned after 30 days.
 
 Configuration lives in `~/Library/Application Support/Mumbletype/`; logs in
 `~/Library/Logs/Mumbletype.log`.

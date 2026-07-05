@@ -36,10 +36,12 @@ log = logging.getLogger("mumbletype")
 
 from clipboard import paste_text
 from config import Config
+from history import History
 from mainthread import run_on_main
 from recorder import CHANNELS, SAMPLE_RATE, Recorder
 
 config = Config()
+history = History()
 
 # ── OpenAI client ────────────────────────────────────────────────────────
 # Bounded timeout: the default (600s × retries) leaves the pill spinning for
@@ -189,6 +191,10 @@ class App:
             log.warning("empty transcription")
             return False
 
+        # Log to history before pasting: if the paste lands in the wrong
+        # window (focus stolen mid-dictation), the text is still recoverable
+        # from the menubar History submenu.
+        history.add(text)
         paste_text(text)
         log.info("transcribed %.1fs: %s", duration_seconds, text)
         config.record_usage(duration_seconds)
@@ -212,7 +218,7 @@ def main():
     # The hotkey callback fires on the main thread and only enqueues a toggle,
     # so it can neither block the event loop nor raise.
     hotkey_manager = HotkeyManager(config, on_fire=app.recorder.toggle)
-    app.status_bar = StatusBarController(config, hotkey_manager)
+    app.status_bar = StatusBarController(config, hotkey_manager, history)
 
     # Manually pump the event loop instead of app.run() so Python can handle
     # SIGINT (Ctrl+C). app.run() blocks in ObjC and never lets Python dispatch
