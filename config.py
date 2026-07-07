@@ -26,8 +26,11 @@ class Config:
 
     # Used for dropped/picked audio files (not live dictation): supports
     # speaker diarization. Not in MODELS — it would be waste on 5s dictations.
+    # Rate covers both passes: diarize ($0.006/min, speaker timeline) +
+    # whisper-1 ($0.006/min, text — the diarize model translates foreign
+    # speech into English).
     FILE_MODELS = {
-        "gpt-4o-transcribe-diarize": {"rate_per_min": 0.006, "label": "GPT-4o Transcribe Diarize"},
+        "gpt-4o-transcribe-diarize": {"rate_per_min": 0.012, "label": "GPT-4o Transcribe Diarize"},
     }
 
     # Language pin for file transcription ("" = auto-detect). Auto-detection

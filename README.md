@@ -44,7 +44,7 @@ the app automatically if it ever crashes. Quitting from the menu stays quit.
 | GPT-4o Mini Transcribe | $0.003/min | Default, fast and cheap |
 | GPT-4o Transcribe | $0.006/min | Higher accuracy |
 | Whisper-1 | $0.006/min | Original Whisper model |
-| GPT-4o Transcribe Diarize | $0.006/min | Audio files only — speaker diarization |
+| GPT-4o Transcribe Diarize + Whisper-1 | $0.012/min | Audio files only — speaker diarization + text |
 
 Switch dictation models from the menubar dropdown or Preferences window.
 Dropped audio files always use the diarization-capable model (override with
@@ -67,16 +67,21 @@ submenu shows the recent entries; clicking one copies it to the clipboard.
 Entries are pruned after 30 days.
 
 Audio files (m4a, mp3, wav, flac, ogg, and anything else CoreAudio reads)
-are transcribed with speaker diarization via `gpt-4o-transcribe-diarize`.
-Recordings longer than the model's ~23-minute per-request limit are split
-into 10-minute chunks at quiet moments and transcribed in parallel; short
-voice samples of each speaker from the first chunk are passed along so
-"Speaker A" stays the same person across chunks. Oddly-encoded files are
-re-encoded with the system's `afconvert` to fit the API's 25 MB upload
-cap. File transcripts are never auto-pasted — they land on the clipboard,
-in History, and in a `.transcript.txt` beside the source file, with
-per-file progress in a small floating panel. Dictation and file
-transcription costs are tracked separately in the menubar.
+are transcribed in two concurrent passes: `whisper-1` produces the text
+(the diarize model tends to *translate* non-English speech into English,
+even with the language pinned; whisper stays in the source language) and
+`gpt-4o-transcribe-diarize` produces the who-speaks-when timeline. The
+timestamped whisper sentences are then attributed to speakers by overlap.
+Recordings longer than the diarize model's ~23-minute per-request limit
+are split into 10-minute chunks at quiet moments and transcribed in
+parallel; short voice samples of each speaker from the first chunk are
+passed along so "Speaker A" stays the same person across chunks.
+Oddly-encoded files are re-encoded with the system's `afconvert` to fit
+the API's 25 MB upload cap. File transcripts are never auto-pasted — they
+land on the clipboard, in the File Transcripts menu, and in a
+`.transcript.txt` beside the source file, with per-file progress in a
+small floating panel. Dictation and file transcription costs are tracked
+separately in the menubar.
 
 Configuration lives in `~/Library/Application Support/Mumbletype/`; logs in
 `~/Library/Logs/Mumbletype.log`.
