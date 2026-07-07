@@ -30,6 +30,18 @@ class Config:
         "gpt-4o-transcribe-diarize": {"rate_per_min": 0.006, "label": "GPT-4o Transcribe Diarize"},
     }
 
+    # Language pin for file transcription ("" = auto-detect). Auto-detection
+    # runs per server-side chunk and can flip mid-file — German recordings
+    # have come back partially translated into English.
+    FILE_LANGUAGES = {
+        "": "Auto-detect",
+        "de": "Deutsch",
+        "en": "English",
+        "fr": "Français",
+        "es": "Español",
+        "it": "Italiano",
+    }
+
     _DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Mumbletype")
     _CONFIG_PATH = os.path.join(_DIR, "config.json")
     _ENV_PATH = os.path.join(_DIR, ".env")
@@ -63,6 +75,16 @@ class Config:
     def get_file_model(self) -> str:
         """Model for transcribing dropped audio files (diarization-capable)."""
         return self._data.get("file_model", "gpt-4o-transcribe-diarize")
+
+    def get_file_language(self) -> str:
+        """ISO-639-1 language pin for file transcription; "" = auto-detect."""
+        return self._data.get("file_language", "")
+
+    def set_file_language(self, language: str):
+        with self._lock:
+            self._data["file_language"] = language
+            self._save()
+        self._notify()
 
     def get_audio_device_name(self) -> str | None:
         """Return the stored audio input device name, or None for system default."""

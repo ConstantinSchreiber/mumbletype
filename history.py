@@ -31,23 +31,38 @@ class History:
 
     # ── public API ───────────────────────────────────────────────────────
 
-    def add(self, text: str):
+    def add(self, text: str, kind: str = "dictation", label: str | None = None):
+        """kind separates dictations from file transcripts (entries without a
+        kind predate the split and count as dictations); label is a display
+        name, e.g. the source filename."""
+        entry: dict = {"ts": datetime.now(timezone.utc).isoformat(), "text": text}
+        if kind != "dictation":
+            entry["kind"] = kind
+        if label:
+            entry["label"] = label
         with self._lock:
-            self._entries.append(
-                {"ts": datetime.now(timezone.utc).isoformat(), "text": text}
-            )
+            self._entries.append(entry)
             self._prune()
             self._save()
         self._notify()
 
-    def entries(self) -> list[dict]:
-        """Return entries newest-first."""
+    def entries(self, kind: str | None = None) -> list[dict]:
+        """Return entries newest-first, optionally filtered by kind."""
         with self._lock:
-            return list(reversed(self._entries))
+            entries = list(reversed(self._entries))
+        if kind is None:
+            return entries
+        return [e for e in entries if e.get("kind", "dictation") == kind]
 
-    def clear(self):
+    def clear(self, kind: str | None = None):
+        """Drop all entries, or only those of the given kind."""
         with self._lock:
-            self._entries = []
+            if kind is None:
+                self._entries = []
+            else:
+                self._entries = [
+                    e for e in self._entries if e.get("kind", "dictation") != kind
+                ]
             self._save()
         self._notify()
 

@@ -239,13 +239,14 @@ class App:
                     on_progress=lambda msg, j=jid: run_on_main(
                         lambda: self.jobs.progress(j, msg)
                     ),
+                    language=config.get_file_language() or None,
                 )
                 if not text:
                     raise RuntimeError("the API returned an empty transcription")
                 # History first, then clipboard — same recoverability rationale
                 # as dictation. No paste: transcripts can be huge and focus is
                 # arbitrary, so the user pastes where they want it.
-                history.add(text)
+                history.add(text, kind="file", label=os.path.basename(path))
                 self._save_transcript(path, text)
                 config.record_file_usage(duration)
                 run_on_main(lambda t=text, j=jid: (copy_text(t), self.jobs.done(j, t)))

@@ -68,31 +68,37 @@ def is_audio_file(path: str) -> bool:
     return ext in AUDIO_EXTENSIONS and os.path.isfile(path)
 
 
-def transcribe_file(client, path, model, fallback_model=None, on_progress=None):
+def transcribe_file(client, path, model, fallback_model=None, on_progress=None,
+                    language=None):
     """Transcribe one audio file. Returns (formatted_text, duration_seconds).
 
     fallback_model, if given, is retried plain (no diarization) when the API
     rejects the diarize model — e.g. an org without access to it.
     on_progress, if given, receives short human-readable stage strings on the
     calling thread.
+    language ("de", "en", …) pins the transcription language. Auto-detection
+    happens per server-side chunk and can drift — German speech has come back
+    translated into English mid-file.
     """
     notify = on_progress or (lambda msg: None)
     duration = _probe_duration(path)
     if duration is not None and duration > _MAX_SINGLE_SECONDS:
-        return _transcribe_chunked(client, path, model, fallback_model, notify)
+        return _transcribe_chunked(client, path, model, fallback_model, notify, language)
     try:
-        return _transcribe_single(client, path, model, fallback_model, notify)
+        return _transcribe_single(client, path, model, fallback_model, notify, language)
     except _AudioTooLong:
         # afinfo under-reported (or was unparseable); do it the long way.
         log.info("%s too long for a single request; chunking", os.path.basename(path))
-        return _transcribe_chunked(client, path, model, fallback_model, notify)
+        return _transcribe_chunked(client, path, model, fallback_model, notify, language)
 
 
 # ── API calls ─────────────────────────────────────────────────────────────
 
 
-def _create(client, model, f, diarize, names=None, refs=None):
+def _create(client, model, f, diarize, names=None, refs=None, language=None):
     kwargs = {}
+    if language:
+        kwargs["language"] = language
     if diarize:
         kwargs["response_format"] = "diarized_json"
         # Required for audio over 30s: the API splits long audio server-side
@@ -104,10 +110,12 @@ def _create(client, model, f, diarize, names=None, refs=None):
     return client.audio.transcriptions.create(model=model, file=f, timeout=_TIMEOUT, **kwargs)
 
 
-def _create_with_fallback(client, model, fallback_model, f, names=None, refs=None):
+def _create_with_fallback(client, model, fallback_model, f, names=None, refs=None,
+                          language=None):
     """Diarized call with plain-model retry. Returns (result, used_diarize)."""
     try:
-        return _create(client, model, f, diarize=True, names=names, refs=refs), True
+        return _create(client, model, f, diarize=True, names=names, refs=refs,
+                       language=language), True
     except (openai.NotFoundError, openai.BadRequestError) as e:
         if isinstance(e, openai.BadRequestError) and _is_too_long_error(e):
             raise _AudioTooLong() from e
@@ -118,7 +126,7 @@ def _create_with_fallback(client, model, fallback_model, f, names=None, refs=Non
             model, e, fallback_model,
         )
         f.seek(0)
-        return _create(client, fallback_model, f, diarize=False), False
+        return _create(client, fallback_model, f, diarize=False, language=language), False
 
 
 def _is_too_long_error(e) -> bool:
@@ -126,12 +134,13 @@ def _is_too_long_error(e) -> bool:
     return "longer than" in msg or "input_too_large" in msg or "too large" in msg
 
 
-def _transcribe_single(client, path, model, fallback_model, notify):
+def _transcribe_single(client, path, model, fallback_model, notify, language=None):
     upload_path, is_temp = _prepare_upload(path)
     try:
         notify("transcribing…")
         with open(upload_path, "rb") as f:
-            result, _ = _create_with_fallback(client, model, fallback_model, f)
+            result, _ = _create_with_fallback(client, model, fallback_model, f,
+                                              language=language)
     finally:
         if is_temp:
             _unlink_quiet(upload_path)
@@ -141,7 +150,7 @@ def _transcribe_single(client, path, model, fallback_model, notify):
 # ── chunked path (long recordings) ────────────────────────────────────────
 
 
-def _transcribe_chunked(client, path, model, fallback_model, notify):
+def _transcribe_chunked(client, path, model, fallback_model, notify, language=None):
     notify("preparing…")
     wav_path = _decode_to_wav(path)
     try:
@@ -160,7 +169,8 @@ def _transcribe_chunked(client, path, model, fallback_model, notify):
     # clips that keep labels consistent everywhere else.
     notify(f"part 1/{total}…")
     a, b = bounds[0]
-    result, diarize = _transcribe_chunk(client, model, fallback_model, samples[a:b], rate)
+    result, diarize = _transcribe_chunk(client, model, fallback_model, samples[a:b],
+                                        rate, language=language)
     results: list = [result]
 
     # Chunk 1's raw labels are mapped once and reused at stitch time below:
@@ -187,7 +197,7 @@ def _transcribe_chunked(client, path, model, fallback_model, notify):
                 client, model if diarize else fallback_model,
                 fallback_model, samples[ca:cb], rate,
                 names=speakers.names or None, refs=speakers.refs or None,
-                diarize=diarize,
+                diarize=diarize, language=language,
             )
             return r
 
@@ -218,15 +228,16 @@ def _transcribe_chunked(client, path, model, fallback_model, notify):
 
 
 def _transcribe_chunk(client, model, fallback_model, chunk_samples, rate,
-                      names=None, refs=None, diarize=True):
+                      names=None, refs=None, diarize=True, language=None):
     chunk_path = _encode_chunk(chunk_samples, rate)
     try:
         with open(chunk_path, "rb") as f:
             if diarize:
                 return _create_with_fallback(
-                    client, model, fallback_model, f, names=names, refs=refs
+                    client, model, fallback_model, f, names=names, refs=refs,
+                    language=language,
                 )
-            return _create(client, model, f, diarize=False), False
+            return _create(client, model, f, diarize=False, language=language), False
     finally:
         _unlink_quiet(chunk_path)
 

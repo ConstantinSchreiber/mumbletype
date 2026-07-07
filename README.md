@@ -25,7 +25,7 @@ python mumbletype.py
 - **⌃D** (configurable) — Hit once to record, hit again to transcribe and paste
 - Click the menubar mic icon for model selection, history, usage stats, Start at Login, and preferences
 - **History** submenu — every transcription is kept for 30 days; click an entry to copy it back to the clipboard (rescues text when a prompt or stray click steals focus and the paste goes astray)
-- **Transcribe audio files** — drag audio files (e.g. iPhone Voice Memos) onto the menubar mic icon, or use *Transcribe Audio File…* from the menu. Multi-speaker recordings come back diarized as `Speaker A:` / `Speaker B:` turns. A small floating panel shows each file's progress and elapsed time so you can keep working; when a file finishes, its transcript is copied to the clipboard, added to History, and saved as `<name>.transcript.txt` next to the audio file (click the row to copy it again)
+- **Transcribe audio files** — drag audio files (e.g. iPhone Voice Memos) onto the menubar mic icon, or use *Transcribe Audio File…* from the menu. Multi-speaker recordings come back diarized as `Speaker A:` / `Speaker B:` turns. A small floating panel shows each file's progress and elapsed time so you can keep working; when a file finishes, its transcript is copied to the clipboard, kept in the **File Transcripts** submenu (click an entry to copy it out), and saved as `<name>.transcript.txt` next to the audio file. If your recordings are one language, pin it in Preferences → File Transcription Language — auto-detection can drift into translating long recordings
 - Change the hotkey in Preferences → Record Hotkey → Change…
 
 The hotkey is registered system-wide via Carbon `RegisterEventHotKey`: it is

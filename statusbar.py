@@ -116,16 +116,24 @@ class _MenuDelegate(NSObject):
     def copyHistoryItem_(self, sender):
         self._ctrl._copy_history_item(sender.representedObject())
 
+    def clearFileTranscripts_(self, sender):
+        if self._ctrl._history:
+            self._ctrl._history.clear(kind="file")
+
     def transcribeFile_(self, sender):
         self._ctrl._choose_files_to_transcribe()
 
     def clearHistory_(self, sender):
         if self._ctrl._history:
-            self._ctrl._history.clear()
+            self._ctrl._history.clear(kind="dictation")
 
     def menuNeedsUpdate_(self, menu):
-        # AppKit calls this on the main thread each time the submenu opens.
-        self._ctrl._populate_history_menu(menu)
+        # AppKit calls this on the main thread each time a submenu opens;
+        # both the History and File Transcripts submenus share this delegate.
+        if menu is self._ctrl._files_menu:
+            self._ctrl._populate_files_menu(menu)
+        else:
+            self._ctrl._populate_history_menu(menu)
 
     def toggleLogin_(self, sender):
         self._ctrl._toggle_login()
@@ -219,8 +227,9 @@ class StatusBarController:
         self._model_mi.setSubmenu_(model_submenu)
         menu.addItem_(self._model_mi)
 
-        # History submenu — repopulated on every open via menuNeedsUpdate:,
-        # so no listener wiring is needed to keep it fresh.
+        # History / File Transcripts submenus — repopulated on every open via
+        # menuNeedsUpdate:, so no listener wiring is needed to keep them fresh.
+        self._files_menu = None
         if self._history is not None:
             history_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "History", None, ""
@@ -229,6 +238,14 @@ class StatusBarController:
             self._history_menu.setDelegate_(self._delegate)
             history_mi.setSubmenu_(self._history_menu)
             menu.addItem_(history_mi)
+
+            files_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "File Transcripts", None, ""
+            )
+            self._files_menu = AppKit.NSMenu.alloc().init()
+            self._files_menu.setDelegate_(self._delegate)
+            files_mi.setSubmenu_(self._files_menu)
+            menu.addItem_(files_mi)
 
         if self._on_transcribe_files is not None:
             transcribe_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -310,28 +327,45 @@ class StatusBarController:
         )
 
     def _populate_history_menu(self, menu):
-        """Rebuild the History submenu from the store. Main thread only."""
+        """Rebuild the dictation History submenu from the store. Main thread only."""
+        entries = self._history.entries(kind="dictation") if self._history else []
+        self._populate_entries_menu(
+            menu, entries, "No transcriptions yet",
+            lambda e: f"{_age(e.get('ts', ''))} · {_snippet(e['text'])}",
+            "Clear History", "clearHistory:",
+        )
+
+    def _populate_files_menu(self, menu):
+        """Rebuild the File Transcripts submenu from the store. Main thread only."""
+        entries = self._history.entries(kind="file") if self._history else []
+        self._populate_entries_menu(
+            menu, entries, "No file transcripts yet",
+            lambda e: f"{_age(e.get('ts', ''))} · {e.get('label') or _snippet(e['text'])}",
+            "Clear File Transcripts", "clearFileTranscripts:",
+        )
+
+    def _populate_entries_menu(self, menu, entries, empty_title, title_for,
+                               clear_title, clear_action):
         menu.removeAllItems()
-        entries = self._history.entries() if self._history else []
         if not entries:
             empty = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "No transcriptions yet", None, ""
+                empty_title, None, ""
             )
             empty.setEnabled_(False)
             menu.addItem_(empty)
             return
         for entry in entries[:_HISTORY_MENU_LIMIT]:
-            title = f"{_age(entry.get('ts', ''))} · {_snippet(entry['text'])}"
             mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                title, "copyHistoryItem:", ""
+                title_for(entry), "copyHistoryItem:", ""
             )
             mi.setTarget_(self._delegate)
             mi.setRepresentedObject_(entry["text"])
-            mi.setToolTip_(entry["text"])
+            # Meeting transcripts run to tens of KB; keep the tooltip sane.
+            mi.setToolTip_(_snippet(entry["text"], 400))
             menu.addItem_(mi)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
         clear_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Clear History", "clearHistory:", ""
+            clear_title, clear_action, ""
         )
         clear_mi.setTarget_(self._delegate)
         menu.addItem_(clear_mi)
