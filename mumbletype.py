@@ -34,7 +34,8 @@ def setup_logging():
 setup_logging()
 log = logging.getLogger("mumbletype")
 
-from clipboard import paste_text
+import filetranscribe
+from clipboard import copy_text, paste_text
 from config import Config
 from history import History
 from mainthread import run_on_main
@@ -97,7 +98,8 @@ class App:
     UI session state (_ui_session) is owned by the main thread; recorder and
     transcription callbacks marshal themselves there. The session guard means
     a stale transcription finishing late can never hide or corrupt the pill
-    of a newer recording.
+    of a newer recording. Tokens are namespaced ("rec"/"file") so recorder
+    sessions and file-transcription batches can't collide.
     """
 
     def __init__(self, indicator):
@@ -110,19 +112,20 @@ class App:
             on_stopped=self._recording_stopped,
             on_chunk=indicator.push_audio,
         )
-        self._ui_session = 0
+        self._ui_session = ("rec", 0)
+        self._file_batch = 0  # main thread only
 
     # ── recorder callbacks (worker thread) ──────────────────────────────
 
     def _recording_started(self, sid):
         threading.Thread(target=_prewarm, name="prewarm", daemon=True).start()
-        run_on_main(lambda: self._set_ui(sid, "recording"))
+        run_on_main(lambda: self._set_ui(("rec", sid), "recording"))
 
     def _recording_failed(self, sid):
-        run_on_main(lambda: self._fail_ui(sid))
+        run_on_main(lambda: self._fail_ui(("rec", sid)))
 
     def _recording_stopped(self, sid, frames):
-        run_on_main(lambda: self._set_ui(sid, "transcribing"))
+        run_on_main(lambda: self._set_ui(("rec", sid), "transcribing"))
         threading.Thread(
             target=self._transcribe, args=(sid, frames),
             name=f"transcribe-{sid}", daemon=True,
@@ -130,8 +133,8 @@ class App:
 
     # ── UI state (main thread) ──────────────────────────────────────────
 
-    def _set_ui(self, sid, state):
-        self._ui_session = sid
+    def _set_ui(self, token, state):
+        self._ui_session = token
         if state == "recording":
             self.indicator.show("recording")
         else:
@@ -139,14 +142,14 @@ class App:
         if self.status_bar:
             self.status_bar.update_status(state)
 
-    def _fail_ui(self, sid):
-        self._ui_session = sid
+    def _fail_ui(self, token):
+        self._ui_session = token
         self.indicator.flash_error()
         if self.status_bar:
             self.status_bar.update_status("idle")
 
-    def _finish(self, sid, ok):
-        if sid != self._ui_session:
+    def _finish(self, token, ok):
+        if token != self._ui_session:
             return  # a newer recording owns the pill
         if ok:
             self.indicator.hide()
@@ -163,7 +166,7 @@ class App:
             ok = self._transcribe_and_paste(frames)
         except Exception:
             log.exception("transcription failed")
-        run_on_main(lambda: self._finish(sid, ok))
+        run_on_main(lambda: self._finish(("rec", sid), ok))
 
     @staticmethod
     def _transcribe_and_paste(frames) -> bool:
@@ -200,6 +203,62 @@ class App:
         config.record_usage(duration_seconds)
         return True
 
+    # ── file transcription (dropped/picked audio files) ─────────────────
+
+    def transcribe_files(self, paths):
+        """Transcribe audio files with speaker diarization. Main thread only
+        (called from the status-bar menu or the icon drop target)."""
+        paths = [p for p in paths if filetranscribe.is_audio_file(p)]
+        if not paths:
+            self.indicator.flash_error()
+            return
+        self._file_batch += 1
+        token = ("file", self._file_batch)
+        self._set_ui(token, "transcribing")
+        threading.Thread(
+            target=self._transcribe_files, args=(token, paths),
+            name=f"transcribe-file-{self._file_batch}", daemon=True,
+        ).start()
+
+    def _transcribe_files(self, token, paths):
+        ok = True
+        for path in paths:
+            try:
+                text, duration = filetranscribe.transcribe_file(
+                    get_client(), path,
+                    model=config.get_file_model(),
+                    fallback_model=config.get_model(),
+                )
+                if not text:
+                    log.warning("empty transcription for %s", path)
+                    ok = False
+                    continue
+                # History first, then clipboard — same recoverability rationale
+                # as dictation. No paste: transcripts can be huge and focus is
+                # arbitrary, so the user pastes where they want it.
+                history.add(text)
+                run_on_main(lambda t=text: copy_text(t))
+                self._save_transcript(path, text)
+                config.record_usage(duration, model=config.get_file_model())
+                log.info("transcribed file %s (%.1fs audio, %d chars)",
+                         os.path.basename(path), duration, len(text))
+            except Exception:
+                log.exception("file transcription failed: %s", path)
+                ok = False
+        run_on_main(lambda: self._finish(token, ok))
+
+    @staticmethod
+    def _save_transcript(path, text):
+        """Best-effort durable copy next to the audio file — history caps at
+        30 days / 500 entries, a meeting transcript shouldn't."""
+        txt_path = os.path.splitext(path)[0] + ".transcript.txt"
+        try:
+            with open(txt_path, "w") as f:
+                f.write(text + "\n")
+            log.info("saved transcript: %s", txt_path)
+        except OSError:
+            log.warning("could not save transcript next to %s", path, exc_info=True)
+
 
 def main():
     log.info("Mumbletype running · %s to record/stop · Ctrl+C to quit", config.get_hotkey()[2])
@@ -218,7 +277,9 @@ def main():
     # The hotkey callback fires on the main thread and only enqueues a toggle,
     # so it can neither block the event loop nor raise.
     hotkey_manager = HotkeyManager(config, on_fire=app.recorder.toggle)
-    app.status_bar = StatusBarController(config, hotkey_manager, history)
+    app.status_bar = StatusBarController(
+        config, hotkey_manager, history, on_transcribe_files=app.transcribe_files
+    )
 
     # Manually pump the event loop instead of app.run() so Python can handle
     # SIGINT (Ctrl+C). app.run() blocks in ObjC and never lets Python dispatch

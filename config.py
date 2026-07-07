@@ -24,6 +24,12 @@ class Config:
         "whisper-1": {"rate_per_min": 0.006, "label": "Whisper-1"},
     }
 
+    # Used for dropped/picked audio files (not live dictation): supports
+    # speaker diarization. Not in MODELS — it would be waste on 5s dictations.
+    FILE_MODELS = {
+        "gpt-4o-transcribe-diarize": {"rate_per_min": 0.006, "label": "GPT-4o Transcribe Diarize"},
+    }
+
     _DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Mumbletype")
     _CONFIG_PATH = os.path.join(_DIR, "config.json")
     _ENV_PATH = os.path.join(_DIR, ".env")
@@ -53,6 +59,10 @@ class Config:
             self._data["model"] = model
             self._save()
         self._notify()
+
+    def get_file_model(self) -> str:
+        """Model for transcribing dropped audio files (diarization-capable)."""
+        return self._data.get("file_model", "gpt-4o-transcribe-diarize")
 
     def get_audio_device_name(self) -> str | None:
         """Return the stored audio input device name, or None for system default."""
@@ -85,9 +95,10 @@ class Config:
 
     # ── usage / cost tracking ────────────────────────────────────────────
 
-    def record_usage(self, duration_seconds: float):
-        model = self.get_model()
-        rate = self.MODELS.get(model, {}).get("rate_per_min", 0.003)
+    def record_usage(self, duration_seconds: float, model: str | None = None):
+        if model is None:
+            model = self.get_model()
+        rate = (self.MODELS | self.FILE_MODELS).get(model, {}).get("rate_per_min", 0.003)
         cost = (duration_seconds / 60.0) * rate
         with self._lock:
             usage = self._data.setdefault("usage", self._default_usage())

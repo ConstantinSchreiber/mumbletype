@@ -4,9 +4,12 @@ import logging
 from datetime import datetime, timezone
 
 import AppKit
-from Foundation import NSObject
+import objc
+from Foundation import NSObject, NSURL
 
+import filetranscribe
 import launchagent
+from clipboard import copy_text
 from config import Config
 from mainthread import run_on_main
 
@@ -39,6 +42,59 @@ def _age(ts_iso: str) -> str:
     return f"{seconds // 86400}d"
 
 
+class _DropTargetView(AppKit.NSView):
+    """Invisible overlay on the status-item button that accepts audio-file
+    drags; mouse clicks are forwarded to the button so the menu still opens."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(_DropTargetView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._button = None
+        self._handler = None
+        self.registerForDraggedTypes_([AppKit.NSPasteboardTypeFileURL])
+        return self
+
+    @objc.python_method
+    def attach(self, button, handler):
+        self._button = button
+        self._handler = handler
+        self.setFrame_(button.bounds())
+        self.setAutoresizingMask_(
+            AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
+        )
+        button.addSubview_(self)
+
+    @objc.python_method
+    def _audio_paths(self, sender):
+        urls = sender.draggingPasteboard().readObjectsForClasses_options_(
+            [NSURL], {AppKit.NSPasteboardURLReadingFileURLsOnlyKey: True}
+        )
+        return [u.path() for u in (urls or []) if filetranscribe.is_audio_file(u.path())]
+
+    def draggingEntered_(self, sender):
+        if self._audio_paths(sender):
+            return AppKit.NSDragOperationCopy
+        return AppKit.NSDragOperationNone
+
+    def performDragOperation_(self, sender):
+        paths = self._audio_paths(sender)
+        if not paths or self._handler is None:
+            return False
+        # Defer past the drag session so Finder's drop animation isn't
+        # blocked behind UI work.
+        run_on_main(lambda: self._handler(paths))
+        return True
+
+    def mouseDown_(self, event):
+        if self._button is not None:
+            self._button.mouseDown_(event)
+
+    def rightMouseDown_(self, event):
+        if self._button is not None:
+            self._button.rightMouseDown_(event)
+
+
 class _MenuDelegate(NSObject):
     """Handles menu item actions."""
 
@@ -59,6 +115,9 @@ class _MenuDelegate(NSObject):
 
     def copyHistoryItem_(self, sender):
         self._ctrl._copy_history_item(sender.representedObject())
+
+    def transcribeFile_(self, sender):
+        self._ctrl._choose_files_to_transcribe()
 
     def clearHistory_(self, sender):
         if self._ctrl._history:
@@ -83,13 +142,15 @@ class StatusBarController:
     invoked from any thread).
     """
 
-    def __init__(self, config: Config, hotkey_manager=None, history=None):
+    def __init__(self, config: Config, hotkey_manager=None, history=None,
+                 on_transcribe_files=None):
         global _controller
         _controller = self  # prevent GC
 
         self._config = config
         self._hotkey_manager = hotkey_manager
         self._history = history
+        self._on_transcribe_files = on_transcribe_files
         self._prefs_window = None
         self._delegate = _MenuDelegate.alloc().initWithController_(self)
 
@@ -112,6 +173,12 @@ class StatusBarController:
         self._build_menu()
         self._refresh_titles()
         self._config.add_listener(lambda: run_on_main(self._refresh_titles))
+
+        if self._on_transcribe_files is not None:
+            self._drop_view = _DropTargetView.alloc().initWithFrame_(
+                ((0, 0), (0, 0))
+            )
+            self._drop_view.attach(button, self._on_transcribe_files)
 
     def update_status(self, state: str):
         labels = {"idle": "Idle", "recording": "Recording...", "transcribing": "Transcribing..."}
@@ -162,6 +229,17 @@ class StatusBarController:
             self._history_menu.setDelegate_(self._delegate)
             history_mi.setSubmenu_(self._history_menu)
             menu.addItem_(history_mi)
+
+        if self._on_transcribe_files is not None:
+            transcribe_mi = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Transcribe Audio File…", "transcribeFile:", ""
+            )
+            transcribe_mi.setTarget_(self._delegate)
+            transcribe_mi.setToolTip_(
+                "Transcribe audio files with speaker labels. "
+                "You can also drop files onto the menu bar icon."
+            )
+            menu.addItem_(transcribe_mi)
 
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
@@ -254,11 +332,21 @@ class StatusBarController:
     def _copy_history_item(self, text):
         """Put a past transcription back on the clipboard — plain copy, no
         paste, no restore: the user grabs it whenever they're ready."""
-        if not text:
-            return
-        pb = AppKit.NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+        if text:
+            copy_text(text)
+
+    def _choose_files_to_transcribe(self):
+        panel = AppKit.NSOpenPanel.openPanel()
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(True)
+        panel.setAllowedFileTypes_(sorted(filetranscribe.AUDIO_EXTENSIONS))
+        panel.setMessage_("Choose audio files to transcribe")
+        panel.setPrompt_("Transcribe")
+        AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        if panel.runModal() == AppKit.NSModalResponseOK:
+            paths = [u.path() for u in panel.URLs()]
+            if paths and self._on_transcribe_files:
+                self._on_transcribe_files(paths)
 
     def _toggle_login(self):
         try:

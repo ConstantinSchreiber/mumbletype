@@ -19,6 +19,13 @@ _RESTORE_DELAY = 1.0
 _KEY_V = 0x09  # kVK_ANSI_V
 
 
+def copy_text(text: str):
+    """Plain clipboard copy — no paste, no restore. Main thread only."""
+    pb = AppKit.NSPasteboard.generalPasteboard()
+    pb.clearContents()
+    pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+
+
 def paste_text(text: str):
     """Paste text at the cursor via the clipboard + synthetic Cmd-V.
 

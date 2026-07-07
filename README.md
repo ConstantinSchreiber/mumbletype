@@ -25,6 +25,7 @@ python mumbletype.py
 - **⌃D** (configurable) — Hit once to record, hit again to transcribe and paste
 - Click the menubar mic icon for model selection, history, usage stats, Start at Login, and preferences
 - **History** submenu — every transcription is kept for 30 days; click an entry to copy it back to the clipboard (rescues text when a prompt or stray click steals focus and the paste goes astray)
+- **Transcribe audio files** — drag audio files (e.g. iPhone Voice Memos) onto the menubar mic icon, or use *Transcribe Audio File…* from the menu. Multi-speaker recordings come back diarized as `Speaker A:` / `Speaker B:` turns. The transcript is copied to the clipboard, added to History, and saved as `<name>.transcript.txt` next to the audio file
 - Change the hotkey in Preferences → Record Hotkey → Change…
 
 The hotkey is registered system-wide via Carbon `RegisterEventHotKey`: it is
@@ -43,8 +44,11 @@ the app automatically if it ever crashes. Quitting from the menu stays quit.
 | GPT-4o Mini Transcribe | $0.003/min | Default, fast and cheap |
 | GPT-4o Transcribe | $0.006/min | Higher accuracy |
 | Whisper-1 | $0.006/min | Original Whisper model |
+| GPT-4o Transcribe Diarize | $0.006/min | Audio files only — speaker diarization |
 
-Switch models from the menubar dropdown or Preferences window.
+Switch dictation models from the menubar dropdown or Preferences window.
+Dropped audio files always use the diarization-capable model (override with
+`"file_model"` in `config.json`).
 
 ## How it works
 
@@ -61,6 +65,13 @@ Every transcription is also logged to a local history (before pasting, so
 nothing is lost if the paste lands in the wrong window). The menubar History
 submenu shows the recent entries; clicking one copies it to the clipboard.
 Entries are pruned after 30 days.
+
+Audio files (m4a, mp3, wav, flac, ogg, and anything else CoreAudio reads)
+are transcribed with speaker diarization via `gpt-4o-transcribe-diarize`.
+Long or oddly-encoded files are re-encoded with the system's `afconvert`
+to fit the API's 25 MB upload cap (~1.7 h of speech). File transcripts are
+never auto-pasted — they land on the clipboard, in History, and in a
+`.transcript.txt` beside the source file.
 
 Configuration lives in `~/Library/Application Support/Mumbletype/`; logs in
 `~/Library/Logs/Mumbletype.log`.
