@@ -243,7 +243,8 @@ class StatusBarController:
 
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-        self._usage_mi = add_disabled("Usage:")
+        self._usage_mi = add_disabled("Dictation:")
+        self._file_usage_mi = add_disabled("Files:")
 
         reset_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Reset Usage Stats…", "resetUsage:", ""
@@ -290,8 +291,14 @@ class StatusBarController:
         usage = self._config.get_usage()
         total_min = usage["total_seconds"] / 60.0
         self._usage_mi.setTitle_(
-            f"Usage: {total_min:.1f} min · ${usage['total_cost_usd']:.4f}"
+            f"Dictation: {total_min:.1f} min · ${usage['total_cost_usd']:.4f}"
             f" · {usage['session_count']} sessions"
+        )
+        # .get: usage dicts persisted before the file feature lack these keys
+        file_min = usage.get("file_seconds", 0.0) / 60.0
+        self._file_usage_mi.setTitle_(
+            f"Files: {file_min:.1f} min · ${usage.get('file_cost_usd', 0.0):.4f}"
+            f" · {usage.get('file_count', 0)} files"
         )
 
         self._hotkey_mi.setTitle_(f"Hotkey: {self._config.get_hotkey()[2]}")

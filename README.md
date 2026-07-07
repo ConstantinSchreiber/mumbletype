@@ -25,7 +25,7 @@ python mumbletype.py
 - **⌃D** (configurable) — Hit once to record, hit again to transcribe and paste
 - Click the menubar mic icon for model selection, history, usage stats, Start at Login, and preferences
 - **History** submenu — every transcription is kept for 30 days; click an entry to copy it back to the clipboard (rescues text when a prompt or stray click steals focus and the paste goes astray)
-- **Transcribe audio files** — drag audio files (e.g. iPhone Voice Memos) onto the menubar mic icon, or use *Transcribe Audio File…* from the menu. Multi-speaker recordings come back diarized as `Speaker A:` / `Speaker B:` turns. The transcript is copied to the clipboard, added to History, and saved as `<name>.transcript.txt` next to the audio file
+- **Transcribe audio files** — drag audio files (e.g. iPhone Voice Memos) onto the menubar mic icon, or use *Transcribe Audio File…* from the menu. Multi-speaker recordings come back diarized as `Speaker A:` / `Speaker B:` turns. A small floating panel shows each file's progress and elapsed time so you can keep working; when a file finishes, its transcript is copied to the clipboard, added to History, and saved as `<name>.transcript.txt` next to the audio file (click the row to copy it again)
 - Change the hotkey in Preferences → Record Hotkey → Change…
 
 The hotkey is registered system-wide via Carbon `RegisterEventHotKey`: it is
@@ -68,10 +68,15 @@ Entries are pruned after 30 days.
 
 Audio files (m4a, mp3, wav, flac, ogg, and anything else CoreAudio reads)
 are transcribed with speaker diarization via `gpt-4o-transcribe-diarize`.
-Long or oddly-encoded files are re-encoded with the system's `afconvert`
-to fit the API's 25 MB upload cap (~1.7 h of speech). File transcripts are
-never auto-pasted — they land on the clipboard, in History, and in a
-`.transcript.txt` beside the source file.
+Recordings longer than the model's ~23-minute per-request limit are split
+into 10-minute chunks at quiet moments and transcribed in parallel; short
+voice samples of each speaker from the first chunk are passed along so
+"Speaker A" stays the same person across chunks. Oddly-encoded files are
+re-encoded with the system's `afconvert` to fit the API's 25 MB upload
+cap. File transcripts are never auto-pasted — they land on the clipboard,
+in History, and in a `.transcript.txt` beside the source file, with
+per-file progress in a small floating panel. Dictation and file
+transcription costs are tracked separately in the menubar.
 
 Configuration lives in `~/Library/Application Support/Mumbletype/`; logs in
 `~/Library/Logs/Mumbletype.log`.

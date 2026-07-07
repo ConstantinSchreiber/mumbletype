@@ -89,6 +89,16 @@ def _prewarm():
         log.debug("prewarm request failed", exc_info=True)
 
 
+def _short_error(e: Exception) -> str:
+    """Human-sized error for the jobs panel tooltip."""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        msg = (body.get("error") or {}).get("message")
+        if msg:
+            return msg
+    return str(e) or e.__class__.__name__
+
+
 # ── application ──────────────────────────────────────────────────────────
 
 
@@ -98,12 +108,13 @@ class App:
     UI session state (_ui_session) is owned by the main thread; recorder and
     transcription callbacks marshal themselves there. The session guard means
     a stale transcription finishing late can never hide or corrupt the pill
-    of a newer recording. Tokens are namespaced ("rec"/"file") so recorder
-    sessions and file-transcription batches can't collide.
+    of a newer recording. File transcriptions live entirely in the jobs
+    panel and never touch the pill, so dictation stays independent.
     """
 
-    def __init__(self, indicator):
+    def __init__(self, indicator, jobs):
         self.indicator = indicator
+        self.jobs = jobs
         self.status_bar = None  # attached in main() once the menu bar exists
         self.recorder = Recorder(
             config,
@@ -112,20 +123,19 @@ class App:
             on_stopped=self._recording_stopped,
             on_chunk=indicator.push_audio,
         )
-        self._ui_session = ("rec", 0)
-        self._file_batch = 0  # main thread only
+        self._ui_session = 0
 
     # ── recorder callbacks (worker thread) ──────────────────────────────
 
     def _recording_started(self, sid):
         threading.Thread(target=_prewarm, name="prewarm", daemon=True).start()
-        run_on_main(lambda: self._set_ui(("rec", sid), "recording"))
+        run_on_main(lambda: self._set_ui(sid, "recording"))
 
     def _recording_failed(self, sid):
-        run_on_main(lambda: self._fail_ui(("rec", sid)))
+        run_on_main(lambda: self._fail_ui(sid))
 
     def _recording_stopped(self, sid, frames):
-        run_on_main(lambda: self._set_ui(("rec", sid), "transcribing"))
+        run_on_main(lambda: self._set_ui(sid, "transcribing"))
         threading.Thread(
             target=self._transcribe, args=(sid, frames),
             name=f"transcribe-{sid}", daemon=True,
@@ -133,8 +143,8 @@ class App:
 
     # ── UI state (main thread) ──────────────────────────────────────────
 
-    def _set_ui(self, token, state):
-        self._ui_session = token
+    def _set_ui(self, sid, state):
+        self._ui_session = sid
         if state == "recording":
             self.indicator.show("recording")
         else:
@@ -142,14 +152,14 @@ class App:
         if self.status_bar:
             self.status_bar.update_status(state)
 
-    def _fail_ui(self, token):
-        self._ui_session = token
+    def _fail_ui(self, sid):
+        self._ui_session = sid
         self.indicator.flash_error()
         if self.status_bar:
             self.status_bar.update_status("idle")
 
-    def _finish(self, token, ok):
-        if token != self._ui_session:
+    def _finish(self, sid, ok):
+        if sid != self._ui_session:
             return  # a newer recording owns the pill
         if ok:
             self.indicator.hide()
@@ -166,7 +176,7 @@ class App:
             ok = self._transcribe_and_paste(frames)
         except Exception:
             log.exception("transcription failed")
-        run_on_main(lambda: self._finish(("rec", sid), ok))
+        run_on_main(lambda: self._finish(sid, ok))
 
     @staticmethod
     def _transcribe_and_paste(frames) -> bool:
@@ -207,45 +217,43 @@ class App:
 
     def transcribe_files(self, paths):
         """Transcribe audio files with speaker diarization. Main thread only
-        (called from the status-bar menu or the icon drop target)."""
+        (called from the status-bar menu or the icon drop target). Progress
+        lives in the jobs panel, not the pill."""
         paths = [p for p in paths if filetranscribe.is_audio_file(p)]
         if not paths:
             self.indicator.flash_error()
             return
-        self._file_batch += 1
-        token = ("file", self._file_batch)
-        self._set_ui(token, "transcribing")
+        batch = [(self.jobs.add(p), p) for p in paths]
         threading.Thread(
-            target=self._transcribe_files, args=(token, paths),
-            name=f"transcribe-file-{self._file_batch}", daemon=True,
+            target=self._transcribe_files, args=(batch,),
+            name="transcribe-file", daemon=True,
         ).start()
 
-    def _transcribe_files(self, token, paths):
-        ok = True
-        for path in paths:
+    def _transcribe_files(self, batch):
+        for jid, path in batch:
             try:
                 text, duration = filetranscribe.transcribe_file(
                     get_client(), path,
                     model=config.get_file_model(),
                     fallback_model=config.get_model(),
+                    on_progress=lambda msg, j=jid: run_on_main(
+                        lambda: self.jobs.progress(j, msg)
+                    ),
                 )
                 if not text:
-                    log.warning("empty transcription for %s", path)
-                    ok = False
-                    continue
+                    raise RuntimeError("the API returned an empty transcription")
                 # History first, then clipboard — same recoverability rationale
                 # as dictation. No paste: transcripts can be huge and focus is
                 # arbitrary, so the user pastes where they want it.
                 history.add(text)
-                run_on_main(lambda t=text: copy_text(t))
                 self._save_transcript(path, text)
-                config.record_usage(duration, model=config.get_file_model())
+                config.record_file_usage(duration)
+                run_on_main(lambda t=text, j=jid: (copy_text(t), self.jobs.done(j, t)))
                 log.info("transcribed file %s (%.1fs audio, %d chars)",
                          os.path.basename(path), duration, len(text))
-            except Exception:
+            except Exception as e:
                 log.exception("file transcription failed: %s", path)
-                ok = False
-        run_on_main(lambda: self._finish(token, ok))
+                run_on_main(lambda j=jid, m=_short_error(e): self.jobs.fail(j, m))
 
     @staticmethod
     def _save_transcript(path, text):
@@ -267,12 +275,13 @@ def main():
     import AppKit
     from hotkey import HotkeyManager
     from indicator import Indicator
+    from jobpanel import JobPanel
     from statusbar import StatusBarController
 
     ns_app = AppKit.NSApplication.sharedApplication()
     ns_app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 
-    app = App(Indicator())
+    app = App(Indicator(), JobPanel())
 
     # The hotkey callback fires on the main thread and only enqueues a toggle,
     # so it can neither block the event loop nor raise.

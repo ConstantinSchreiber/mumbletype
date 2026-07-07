@@ -95,10 +95,10 @@ class Config:
 
     # ── usage / cost tracking ────────────────────────────────────────────
 
-    def record_usage(self, duration_seconds: float, model: str | None = None):
-        if model is None:
-            model = self.get_model()
-        rate = (self.MODELS | self.FILE_MODELS).get(model, {}).get("rate_per_min", 0.003)
+    def record_usage(self, duration_seconds: float):
+        """Record dictation usage (the hotkey flow)."""
+        model = self.get_model()
+        rate = self.MODELS.get(model, {}).get("rate_per_min", 0.003)
         cost = (duration_seconds / 60.0) * rate
         with self._lock:
             usage = self._data.setdefault("usage", self._default_usage())
@@ -106,6 +106,21 @@ class Config:
             usage["total_cost_usd"] += cost
             usage["session_count"] += 1
             self._save()
+        self._notify()  # keep the menubar usage line fresh
+
+    def record_file_usage(self, duration_seconds: float):
+        """Record audio-file transcription usage — its own bucket so the
+        menu can show dictation and file costs separately."""
+        model = self.get_file_model()
+        rate = self.FILE_MODELS.get(model, {}).get("rate_per_min", 0.006)
+        cost = (duration_seconds / 60.0) * rate
+        with self._lock:
+            usage = self._data.setdefault("usage", self._default_usage())
+            usage["file_seconds"] = usage.get("file_seconds", 0.0) + duration_seconds
+            usage["file_cost_usd"] = usage.get("file_cost_usd", 0.0) + cost
+            usage["file_count"] = usage.get("file_count", 0) + 1
+            self._save()
+        self._notify()
 
     def get_usage(self) -> dict:
         return dict(self._data.get("usage", self._default_usage()))
@@ -209,5 +224,8 @@ class Config:
             "total_seconds": 0.0,
             "total_cost_usd": 0.0,
             "session_count": 0,
+            "file_seconds": 0.0,
+            "file_cost_usd": 0.0,
+            "file_count": 0,
             "last_reset": datetime.now(timezone.utc).isoformat(),
         }
