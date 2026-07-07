@@ -223,13 +223,46 @@ class App:
         if not paths:
             self.indicator.flash_error()
             return
+        language = self._ask_language(paths)
+        if language is None:
+            return  # cancelled
+        config.set_file_language(language)  # remembered as the next default
         batch = [(self.jobs.add(p), p) for p in paths]
         threading.Thread(
-            target=self._transcribe_files, args=(batch,),
+            target=self._transcribe_files, args=(batch, language),
             name="transcribe-file", daemon=True,
         ).start()
 
-    def _transcribe_files(self, batch):
+    @staticmethod
+    def _ask_language(paths):
+        """Per-batch language picker; returns "" for auto, None on cancel.
+        Main thread only (modal)."""
+        import AppKit
+
+        alert = AppKit.NSAlert.alloc().init()
+        if len(paths) == 1:
+            alert.setMessageText_(f"Transcribe “{os.path.basename(paths[0])}”")
+        else:
+            alert.setMessageText_(f"Transcribe {len(paths)} audio files")
+        alert.setInformativeText_("Language spoken in the recording:")
+        popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            ((0, 0), (220, 25)), False
+        )
+        current = config.get_file_language()
+        for code, label in Config.FILE_LANGUAGES.items():
+            popup.addItemWithTitle_(label)
+            popup.lastItem().setRepresentedObject_(code)
+            if code == current:
+                popup.selectItem_(popup.lastItem())
+        alert.setAccessoryView_(popup)
+        alert.addButtonWithTitle_("Transcribe")
+        alert.addButtonWithTitle_("Cancel")
+        AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
+            return None
+        return popup.selectedItem().representedObject() or ""
+
+    def _transcribe_files(self, batch, language):
         for jid, path in batch:
             try:
                 text, duration = filetranscribe.transcribe_file(
@@ -239,7 +272,7 @@ class App:
                     on_progress=lambda msg, j=jid: run_on_main(
                         lambda: self.jobs.progress(j, msg)
                     ),
-                    language=config.get_file_language() or None,
+                    language=language or None,
                 )
                 if not text:
                     raise RuntimeError("the API returned an empty transcription")

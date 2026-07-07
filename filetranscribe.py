@@ -1,25 +1,33 @@
 """Audio-file transcription with speaker diarization.
 
-Files dropped on the menubar icon (or picked via the menu) are transcribed
-in two concurrent passes per audio piece: whisper-1 produces the text
-(gpt-4o-transcribe-diarize drifts into TRANSLATING foreign speech into
-English, even with the language pinned; whisper's transcribe task token
-keeps it in the source language) and the diarize model produces the
-who-speaks-when timeline. Whisper's timestamped segments are then assigned
-to speakers by overlap. Multi-speaker audio is rendered as "Speaker A: …"
-turns; single-speaker audio as plain text.
+Files dropped on the menubar icon (or picked via the menu) are decoded to
+PCM, split into 10-minute chunks at quiet points (the diarize model rejects
+audio over 1400s and processes at roughly real time), and transcribed in
+two concurrent passes per chunk:
 
-The diarize model rejects audio over 1400s, so long files are split
-client-side into 10-minute chunks at quiet points. Speaker labels stay
-consistent across chunks by passing short reference clips of each speaker
-(extracted from the first chunk) via known_speaker_references.
+- whisper-1 — the TEXT. Chosen empirically over every alternative on real
+  multi-speaker recordings: gpt-4o-transcribe silently DROPS whole spans,
+  gpt-4o-transcribe-diarize translates foreign speech into English even
+  with the language pinned, and gpt-audio chat transcription 500s or
+  truncates on conversational audio. Whisper mishears the odd hard word
+  but is reliably complete — completeness beats per-word WER here.
+- gpt-4o-transcribe-diarize — the who-speaks-when timeline.
+
+Whisper's timestamped segments are attributed to speakers by overlap;
+sentence-level attribution also absorbs sub-second backchannel
+interjections. Multi-speaker audio renders as "Speaker A: …" turns;
+single-speaker as plain text. Missing passes degrade gracefully: no
+whisper → diarized text; no diarization → plain text.
+
+Speaker labels stay consistent across chunks by passing short reference
+clips of each speaker (extracted from the first chunk) via
+known_speaker_references; the remaining chunks then run in parallel.
 """
 
 import base64
 import io
 import logging
 import os
-import re
 import subprocess
 import tempfile
 import threading
@@ -31,24 +39,14 @@ import openai
 
 log = logging.getLogger(__name__)
 
-# Text pass model. Segment timestamps (verbose_json) are whisper-only, and
-# alignment needs them; the 4o-transcribe family offers no timestamps.
 _TEXT_MODEL = "whisper-1"
 
-# The transcriptions endpoint rejects uploads over 25 MB.
-_API_MAX_BYTES = 25 * 1024 * 1024
-
-# gpt-4o-transcribe-diarize rejects "audio duration … longer than 1400
-# seconds"; margin because afinfo durations are estimates.
-_MAX_SINGLE_SECONDS = 1300.0
-# Server-side processing runs at roughly real time, so shorter chunks keep
-# each request well inside the timeout; chunks after the first run in
-# parallel, so more chunks barely cost wall-clock time.
-_CHUNK_SECONDS = 600.0
+_CHUNK_SECONDS = 600.0  # diarize rejects >1400s; ~real-time processing
+_CHUNK_SLACK_SECONDS = 60.0  # absorb a short tail into the last chunk
 _CHUNK_WORKERS = 3
-_SPLIT_SEARCH_SECONDS = 15.0  # hunt for a quiet split point this far around the mark
+_SPLIT_SEARCH_SECONDS = 15.0  # hunt for a quiet split point around the mark
 
-_PCM_RATE = 16000  # decode rate for chunking; plenty for speech models
+_PCM_RATE = 16000  # decode rate; plenty for speech models
 
 # Speaker reference clips must be 2-10s; at most 4 known speakers. Use
 # nearly the full window — longer refs give the matcher a stronger
@@ -57,20 +55,16 @@ _REF_MIN_SECONDS = 2.0
 _REF_TARGET_SECONDS = 9.5
 _MAX_REFS = 4
 
-# Formats the API accepts as-is.
-_NATIVE_EXTENSIONS = {"flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "oga", "ogg", "wav", "webm"}
-# CoreAudio-readable formats afconvert re-encodes to .m4a before upload.
-_CONVERT_EXTENSIONS = {"3gp", "aac", "aif", "aifc", "aiff", "alac", "amr", "caf", "m4b", "m4r"}
-
-AUDIO_EXTENSIONS = _NATIVE_EXTENSIONS | _CONVERT_EXTENSIONS
-
-# A long recording uploads slowly and is chunk-transcribed server-side; the
+# Uploads are slow and chunks are processed server-side at ~real time; the
 # interactive client's 30s budget is far too small here.
 _TIMEOUT = httpx.Timeout(900.0, connect=10.0)
 
-
-class _AudioTooLong(Exception):
-    """Single-shot request rejected for duration; retry via chunking."""
+# Anything CoreAudio reads: decoded to PCM before upload, so no distinction
+# between API-native and convert-only formats.
+AUDIO_EXTENSIONS = {
+    "3gp", "aac", "aif", "aifc", "aiff", "alac", "amr", "caf", "flac", "m4a",
+    "m4b", "m4r", "mp3", "mp4", "mpeg", "mpga", "oga", "ogg", "wav", "webm",
+}
 
 
 def is_audio_file(path: str) -> bool:
@@ -82,24 +76,118 @@ def transcribe_file(client, path, model, fallback_model=None, on_progress=None,
                     language=None):
     """Transcribe one audio file. Returns (formatted_text, duration_seconds).
 
-    fallback_model, if given, is retried plain (no diarization) when the API
-    rejects the diarize model — e.g. an org without access to it.
-    on_progress, if given, receives short human-readable stage strings on the
-    calling thread.
-    language ("de", "en", …) pins the transcription language. Auto-detection
-    happens per server-side chunk and can drift — German speech has come back
-    translated into English mid-file.
+    model is the diarize model; fallback_model is retried plain when the API
+    rejects it (e.g. an org without access). on_progress receives short
+    stage strings on the calling thread. language ("de", "en", …) pins the
+    transcription language — auto-detection can drift mid-file.
     """
     notify = on_progress or (lambda msg: None)
-    duration = _probe_duration(path)
-    if duration is not None and duration > _MAX_SINGLE_SECONDS:
-        return _transcribe_chunked(client, path, model, fallback_model, notify, language)
+    notify("preparing…")
+    wav_path = _decode_to_wav(path)
     try:
-        return _transcribe_single(client, path, model, fallback_model, notify, language)
-    except _AudioTooLong:
-        # afinfo under-reported (or was unparseable); do it the long way.
-        log.info("%s too long for a single request; chunking", os.path.basename(path))
-        return _transcribe_chunked(client, path, model, fallback_model, notify, language)
+        with wave.open(wav_path, "rb") as r:
+            rate = r.getframerate()
+            samples = np.frombuffer(r.readframes(r.getnframes()), dtype=np.int16)
+    finally:
+        _unlink_quiet(wav_path)
+
+    total_duration = len(samples) / rate
+    bounds = _chunk_bounds(samples, rate)
+    total = len(bounds)
+    if total > 1:
+        log.info("chunking %s: %.0fs into %d parts",
+                 os.path.basename(path), total_duration, total)
+
+    # Chunk 1 runs alone: its diarized segments yield the speaker reference
+    # clips that keep labels consistent everywhere else.
+    notify("transcribing…" if total == 1 else f"part 1/{total}…")
+    a, b = bounds[0]
+    diar1, text1, diarize = _transcribe_chunk(
+        client, model, fallback_model, samples[a:b], rate, language=language
+    )
+    chunk_turns: list[list[tuple[str | None, str]]] = [_merge_turns(diar1, text1)]
+
+    # Chunk 1's raw labels are mapped once and reused at stitch time below:
+    # they are chunk-local letters, not registry names, so a second
+    # map_labels() call would mint fresh ids and split every speaker in two.
+    speakers = _SpeakerRegistry()
+    local1 = None
+    if diarize:
+        local1 = speakers.map_labels(label for label, _ in chunk_turns[0])
+        speakers.collect_refs(diar1, local1, samples[a:b], rate)
+
+    # Remaining chunks only need those refs, so they can run in parallel —
+    # server-side processing is roughly real time, which sequential chunking
+    # would compound into multiples of the recording length.
+    if total > 1:
+        notify(f"parts 2-{total}/{total}…" if total > 2 else "part 2/2…")
+        import concurrent.futures as cf
+
+        done = 1
+
+        def run(idx):
+            ca, cb = bounds[idx]
+            diar, text, _ = _transcribe_chunk(
+                client, model if diarize else fallback_model,
+                fallback_model, samples[ca:cb], rate,
+                names=speakers.names or None, refs=speakers.refs or None,
+                diarize=diarize, language=language,
+            )
+            return _merge_turns(diar, text)
+
+        with cf.ThreadPoolExecutor(max_workers=_CHUNK_WORKERS) as ex:
+            futures = {ex.submit(run, idx): idx for idx in range(1, total)}
+            chunk_turns += [[]] * (total - 1)
+            for fut in cf.as_completed(futures):
+                chunk_turns[futures[fut]] = fut.result()
+                done += 1
+                if done < total:
+                    notify(f"{done}/{total} parts done…")
+
+    turns: list[tuple[int | None, str]] = []  # (canonical speaker id | None, text)
+    for idx, raw_turns in enumerate(chunk_turns):
+        local = (local1 if idx == 0 and local1 is not None
+                 else speakers.map_labels(label for label, _ in raw_turns))
+        for label, text in raw_turns:
+            turns.append((local.get(label), text))
+
+    return _render_turns(turns), total_duration
+
+
+def _transcribe_chunk(client, model, fallback_model, chunk_samples, rate,
+                      names=None, refs=None, diarize=True, language=None):
+    """Both passes over one chunk, concurrently.
+
+    Returns (diar_result, text_result | None, used_diarize). The whisper
+    text pass is best-effort: on failure the diarized text stands in.
+    """
+    chunk_path = _encode_chunk(chunk_samples, rate)
+    box: dict = {}
+
+    def text_pass():
+        try:
+            with open(chunk_path, "rb") as f:
+                box["text"] = _create_text(client, f, language)
+        except Exception:
+            log.warning("whisper text pass failed; falling back to diarized text",
+                        exc_info=True)
+
+    t = threading.Thread(target=text_pass, name="whisper-pass", daemon=True)
+    t.start()
+    try:
+        with open(chunk_path, "rb") as f:
+            if diarize:
+                diar_result, used = _create_with_fallback(
+                    client, model, fallback_model, f, names=names, refs=refs,
+                    language=language,
+                )
+            else:
+                diar_result = _create(client, model, f, diarize=False, language=language)
+                used = False
+    finally:
+        t.join()
+        _unlink_quiet(chunk_path)
+    return diar_result, box.get("text"), used
 
 
 # ── API calls ─────────────────────────────────────────────────────────────
@@ -127,8 +215,6 @@ def _create_with_fallback(client, model, fallback_model, f, names=None, refs=Non
         return _create(client, model, f, diarize=True, names=names, refs=refs,
                        language=language), True
     except (openai.NotFoundError, openai.BadRequestError) as e:
-        if isinstance(e, openai.BadRequestError) and _is_too_long_error(e):
-            raise _AudioTooLong() from e
         if not fallback_model or fallback_model == model:
             raise
         log.warning(
@@ -139,7 +225,7 @@ def _create_with_fallback(client, model, fallback_model, f, names=None, refs=Non
         return _create(client, fallback_model, f, diarize=False, language=language), False
 
 
-def _create_whisper(client, f, language=None):
+def _create_text(client, f, language=None):
     kwargs = {"response_format": "verbose_json"}  # timestamped segments
     if language:
         kwargs["language"] = language
@@ -148,41 +234,10 @@ def _create_whisper(client, f, language=None):
     )
 
 
-def _dual_transcribe(client, model, fallback_model, path, names=None, refs=None,
-                     diarize=True, language=None):
-    """Both passes over one uploadable file, concurrently.
-
-    Returns (diar_result, whisper_result | None, used_diarize). The whisper
-    pass is best-effort: on failure the diarized text stands in.
-    """
-    whisper_box = {}
-
-    def text_pass():
-        try:
-            with open(path, "rb") as wf:
-                whisper_box["result"] = _create_whisper(client, wf, language)
-        except Exception:
-            log.warning("whisper text pass failed; falling back to diarized text",
-                        exc_info=True)
-
-    t = threading.Thread(target=text_pass, name="whisper-pass", daemon=True)
-    t.start()
-    try:
-        with open(path, "rb") as f:
-            if diarize:
-                diar_result, used = _create_with_fallback(
-                    client, model, fallback_model, f, names=names, refs=refs,
-                    language=language,
-                )
-            else:
-                diar_result = _create(client, model, f, diarize=False, language=language)
-                used = False
-    finally:
-        t.join()
-    return diar_result, whisper_box.get("result"), used
+# ── merging the passes ────────────────────────────────────────────────────
 
 
-def _merge_turns(diar_result, whisper_result):
+def _merge_turns(diar_result, text_result):
     """Whisper text + diarize speakers → [(raw_label | None, text)] turns.
 
     Each whisper segment goes to the speaker whose diarized segments overlap
@@ -190,154 +245,38 @@ def _merge_turns(diar_result, whisper_result):
     interjections that otherwise shred the transcript into confetti.
     """
     dsegs = (getattr(diar_result, "segments", None) or []) if diar_result else []
-    wsegs = (getattr(whisper_result, "segments", None) or []) if whisper_result else []
-
-    if not wsegs:  # whisper pass failed → diarized text as before
-        if dsegs:
-            return [(s.speaker, (s.text or "").strip())
-                    for s in dsegs if (s.text or "").strip()]
-        for r in (whisper_result, diar_result):
-            text = ((getattr(r, "text", "") or "") if r else "").strip()
-            if text:
-                return [(None, text)]
-        return []
+    wsegs = (getattr(text_result, "segments", None) or []) if text_result else []
+    wtext = ((text_result.text or "") if text_result else "").strip()
 
     if not dsegs:  # no speaker timeline (plain fallback model)
-        text = (whisper_result.text or "").strip()
-        return [(None, text)] if text else []
+        return [(None, wtext)] if wtext else []
 
-    turns: list[tuple[str | None, str]] = []
-    for w in wsegs:
-        text = (w.text or "").strip()
-        if not text:
-            continue
-        overlaps: dict[str, float] = {}
-        for d in dsegs:
-            ov = min(w.end, d.end) - max(w.start, d.start)
-            if ov > 0:
-                overlaps[d.speaker] = overlaps.get(d.speaker, 0.0) + ov
-        if overlaps:
-            label = max(overlaps, key=lambda k: overlaps[k])
-        elif turns:
-            label = turns[-1][0]  # gap segment: stick with the last speaker
-        else:
-            label = dsegs[0].speaker
-        turns.append((label, text))
-    return turns
+    if wsegs:
+        turns: list[tuple[str | None, str]] = []
+        for w in wsegs:
+            text = (w.text or "").strip()
+            if text:
+                turns.append((_overlap_speaker(w.start, w.end, dsegs, turns), text))
+        return turns
+
+    return [(s.speaker, (s.text or "").strip())
+            for s in dsegs if (s.text or "").strip()]
 
 
-def _is_too_long_error(e) -> bool:
-    msg = str(e).lower()
-    return "longer than" in msg or "input_too_large" in msg or "too large" in msg
+def _overlap_speaker(start, end, dsegs, turns):
+    overlaps: dict[str, float] = {}
+    for d in dsegs:
+        ov = min(end, d.end) - max(start, d.start)
+        if ov > 0:
+            overlaps[d.speaker] = overlaps.get(d.speaker, 0.0) + ov
+    if overlaps:
+        return max(overlaps, key=lambda k: overlaps[k])
+    if turns:
+        return turns[-1][0]  # gap: stick with the last speaker
+    return dsegs[0].speaker
 
 
-def _transcribe_single(client, path, model, fallback_model, notify, language=None):
-    upload_path, is_temp = _prepare_upload(path)
-    try:
-        notify("transcribing…")
-        diar, whisper, _ = _dual_transcribe(
-            client, model, fallback_model, upload_path, language=language
-        )
-    finally:
-        if is_temp:
-            _unlink_quiet(upload_path)
-
-    # Relabel by order of first appearance — we pass no known_speaker_names
-    # here, and the API has been seen emitting stray labels like "@".
-    labels: dict[str, int] = {}
-    turns: list[tuple[int | None, str]] = []
-    for label, text in _merge_turns(diar, whisper):
-        if label is not None and label not in labels:
-            labels[label] = len(labels)
-        turns.append((labels.get(label), text))
-    duration = _result_duration(whisper) or _result_duration(diar)
-    return _render_turns(turns), duration
-
-
-# ── chunked path (long recordings) ────────────────────────────────────────
-
-
-def _transcribe_chunked(client, path, model, fallback_model, notify, language=None):
-    notify("preparing…")
-    wav_path = _decode_to_wav(path)
-    try:
-        with wave.open(wav_path, "rb") as r:
-            rate = r.getframerate()
-            samples = np.frombuffer(r.readframes(r.getnframes()), dtype=np.int16)
-    finally:
-        _unlink_quiet(wav_path)
-
-    total_duration = len(samples) / rate
-    bounds = _chunk_bounds(samples, rate)
-    total = len(bounds)
-    log.info("chunking %s: %.0fs into %d parts", os.path.basename(path), total_duration, total)
-
-    # Chunk 1 runs alone: its diarized segments yield the speaker reference
-    # clips that keep labels consistent everywhere else.
-    notify(f"part 1/{total}…")
-    a, b = bounds[0]
-    diar1, whisper1, diarize = _transcribe_chunk(
-        client, model, fallback_model, samples[a:b], rate, language=language
-    )
-    chunk_turns: list[list[tuple[str | None, str]]] = [_merge_turns(diar1, whisper1)]
-
-    # Chunk 1's raw labels are mapped once and reused at stitch time below:
-    # they are chunk-local letters, not registry names, so a second
-    # map_labels() call would mint fresh ids and split every speaker in two.
-    speakers = _SpeakerRegistry()
-    local1 = None
-    if diarize:
-        local1 = speakers.map_labels(label for label, _ in chunk_turns[0])
-        speakers.collect_refs(diar1, local1, samples[a:b], rate)
-
-    # Remaining chunks only need those refs, so they can run in parallel —
-    # server-side processing is roughly real time, which sequential chunking
-    # would compound into multiples of the recording length.
-    if total > 1:
-        notify(f"parts 2-{total}/{total}…" if total > 2 else f"part 2/2…")
-        import concurrent.futures as cf
-
-        done = 1
-
-        def run(idx):
-            ca, cb = bounds[idx]
-            diar, whisper, _ = _transcribe_chunk(
-                client, model if diarize else fallback_model,
-                fallback_model, samples[ca:cb], rate,
-                names=speakers.names or None, refs=speakers.refs or None,
-                diarize=diarize, language=language,
-            )
-            return _merge_turns(diar, whisper)
-
-        with cf.ThreadPoolExecutor(max_workers=_CHUNK_WORKERS) as ex:
-            futures = {ex.submit(run, idx): idx for idx in range(1, total)}
-            chunk_turns += [[]] * (total - 1)
-            for fut in cf.as_completed(futures):
-                chunk_turns[futures[fut]] = fut.result()
-                done += 1
-                if done < total:
-                    notify(f"{done}/{total} parts done…")
-
-    turns: list[tuple[int | None, str]] = []  # (canonical speaker id | None, text)
-    for idx, raw_turns in enumerate(chunk_turns):
-        local = (local1 if idx == 0 and local1 is not None
-                 else speakers.map_labels(label for label, _ in raw_turns))
-        for label, text in raw_turns:
-            turns.append((local.get(label), text))
-
-    return _render_turns(turns), total_duration
-
-
-def _transcribe_chunk(client, model, fallback_model, chunk_samples, rate,
-                      names=None, refs=None, diarize=True, language=None):
-    chunk_path = _encode_chunk(chunk_samples, rate)
-    try:
-        return _dual_transcribe(
-            client, model, fallback_model, chunk_path,
-            names=names, refs=refs, diarize=diarize, language=language,
-        )
-    finally:
-        _unlink_quiet(chunk_path)
+# ── speaker identity across chunks ────────────────────────────────────────
 
 
 class _SpeakerRegistry:
@@ -400,19 +339,28 @@ def _speaker_clip_uri(samples, rate, segs) -> str | None:
         end = min(len(samples), start + int(_REF_MIN_SECONDS * rate * 1.2))
     if end - start < int(_REF_MIN_SECONDS * rate):
         return None
+    return "data:audio/wav;base64," + base64.b64encode(
+        _wav_bytes(samples[start:end], rate)
+    ).decode("ascii")
+
+
+# ── audio handling ────────────────────────────────────────────────────────
+
+
+def _wav_bytes(samples, rate) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(rate)
-        w.writeframes(samples[start:end].tobytes())
-    return "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        w.writeframes(samples.tobytes())
+    return buf.getvalue()
 
 
 def _chunk_bounds(samples, rate) -> list[tuple[int, int]]:
     """Split points as (start, end) sample indices, cut at quiet moments."""
     chunk = int(_CHUNK_SECONDS * rate)
-    slack = int(60 * rate)  # absorb a short tail into the last chunk
+    slack = int(_CHUNK_SLACK_SECONDS * rate)
     bounds = []
     start, n = 0, len(samples)
     while n - start > chunk + slack:
@@ -456,11 +404,8 @@ def _encode_chunk(samples, rate) -> str:
     fd, m4a_tmp = tempfile.mkstemp(suffix=".m4a", prefix="mumbletype-chunk-")
     os.close(fd)
     try:
-        with wave.open(wav_tmp, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes(samples.tobytes())
+        with open(wav_tmp, "wb") as f:
+            f.write(_wav_bytes(samples, rate))
         _run_afconvert(
             ["afconvert", "-f", "m4af", "-d", "aac", "-b", "32000", wav_tmp, m4a_tmp],
             wav_tmp, m4a_tmp,
@@ -468,42 +413,6 @@ def _encode_chunk(samples, rate) -> str:
     finally:
         _unlink_quiet(wav_tmp)
     return m4a_tmp
-
-
-def _probe_duration(path) -> float | None:
-    try:
-        out = subprocess.run(
-            ["afinfo", path], capture_output=True, timeout=60
-        ).stdout.decode(errors="replace")
-        m = re.search(r"estimated duration:\s*([0-9.]+)", out)
-        return float(m.group(1)) if m else None
-    except (subprocess.SubprocessError, OSError, ValueError):
-        return None
-
-
-# ── upload preparation (single-shot path) ─────────────────────────────────
-
-
-def _prepare_upload(path: str) -> tuple[str, bool]:
-    """Return (path_to_upload, is_temp_file). Re-encodes when the file is in
-    a format the API doesn't take or over its size cap."""
-    ext = os.path.splitext(path)[1].lstrip(".").lower()
-    if ext in _NATIVE_EXTENSIONS and os.path.getsize(path) <= _API_MAX_BYTES:
-        return path, False
-    return _reencode(path), True
-
-
-def _reencode(path: str) -> str:
-    """Re-encode to 22.05 kHz mono 32 kbps AAC (~14 MB/hour) via the
-    system's afconvert; plenty of fidelity for speech."""
-    fd, tmp = tempfile.mkstemp(suffix=".m4a", prefix="mumbletype-")
-    os.close(fd)
-    cmd = ["afconvert", "-f", "m4af", "-d", "aac@22050", "-c", "1", "-b", "32000", path, tmp]
-    _run_afconvert(cmd, path, tmp)
-    if os.path.getsize(tmp) > _API_MAX_BYTES:
-        _unlink_quiet(tmp)
-        raise ValueError(f"{os.path.basename(path)} is too long even after re-encoding (25 MB API cap)")
-    return tmp
 
 
 def _run_afconvert(cmd, src, dst):
@@ -523,16 +432,6 @@ def _unlink_quiet(path: str):
 
 
 # ── output formatting ─────────────────────────────────────────────────────
-
-
-def _result_duration(result) -> float:
-    """Audio length for usage tracking. The diarize endpoint has been seen
-    returning duration=0, so fall back to the last segment's end time."""
-    duration = float(getattr(result, "duration", 0.0) or 0.0)
-    if duration > 0.0:
-        return duration
-    segments = getattr(result, "segments", None) or []
-    return max((float(getattr(s, "end", 0.0) or 0.0) for s in segments), default=0.0)
 
 
 def _speaker_display(cid: int) -> str:

@@ -51,7 +51,7 @@ class PreferencesWindowController:
     """NSWindow-based preferences panel."""
 
     _WIDTH = 480
-    _HEIGHT = 504
+    _HEIGHT = 460
 
     def __init__(self, config: Config, hotkey_manager=None, on_close_callback=None):
         self._config = config
@@ -62,7 +62,6 @@ class PreferencesWindowController:
         self._key_secure_field = None
         self._key_visible = False
         self._model_popup = None
-        self._file_lang_popup = None
         self._device_popup = None
         self._delegate = _WindowDelegate.alloc().initWithController_(self)
         self._target = _ButtonTarget.alloc().initWithController_(self)
@@ -157,25 +156,6 @@ class PreferencesWindowController:
             if model_id == current_model:
                 self._model_popup.selectItem_(self._model_popup.lastItem())
         content.addSubview_(self._model_popup)
-        y -= 44
-
-        # ── File transcription language ──────────────────────────────────
-        y = self._add_section_label(content, "File Transcription Language", y)
-
-        self._file_lang_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((20, y - 28), (w - 40, 24)), False
-        )
-        current_lang = self._config.get_file_language()
-        for code, label in Config.FILE_LANGUAGES.items():
-            self._file_lang_popup.addItemWithTitle_(label)
-            self._file_lang_popup.lastItem().setRepresentedObject_(code)
-            if code == current_lang:
-                self._file_lang_popup.selectItem_(self._file_lang_popup.lastItem())
-        self._file_lang_popup.setToolTip_(
-            "Language of dropped audio files. Auto-detect can drift mid-file "
-            "on long recordings — pin it if your memos are one language."
-        )
-        content.addSubview_(self._file_lang_popup)
         y -= 44
 
         # ── Audio Device section ─────────────────────────────────────────
@@ -380,13 +360,6 @@ class PreferencesWindowController:
             model_id = selected.representedObject()
             if model_id:
                 self._config.set_model(model_id)
-
-        # File transcription language
-        lang_selected = self._file_lang_popup.selectedItem()
-        if lang_selected is not None:
-            code = lang_selected.representedObject() or ""
-            if code != self._config.get_file_language():
-                self._config.set_file_language(code)
 
         # Audio device
         dev_selected = self._device_popup.selectedItem()
